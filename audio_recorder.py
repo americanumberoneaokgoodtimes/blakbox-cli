@@ -10,7 +10,6 @@ import argparse
 import glob
 import os
 import sys
-import tempfile
 import time
 import wave
 import subprocess
@@ -43,10 +42,10 @@ def enable_windows_ansi():
 
 SUPPORTED_FORMATS = ['wav', 'mp3', 'flac', 'ogg']
 DEFAULT_SIZE_LIMIT = 4000000000
-DEFAULT_MAX_RECORDINGS = 2
+DEFAULT_MAX_RECORDINGS = 4
 DEFAULT_BIT_DEPTH = 16
-DEFAULT_BIT_RATE = 128
-DEFAULT_SAMPLE_RATE = 44100
+DEFAULT_BIT_RATE = 320
+DEFAULT_SAMPLE_RATE = 48000
 DEFAULT_CHANNELS = 2
 DEFAULT_LENGTH = 999999
 CHUNK_DURATION = 0.5
@@ -70,21 +69,6 @@ ANSI = {
     'clear_line': '\033[K',
     'clear_to_end': '\033[J',
 }
-
-
-FORMAT_ESTIMATES = {
-    'wav': 1.0,
-    'mp3': lambda args: (args.bit_rate * 1000) / (args.sample_rate * args.channels * args.bit_depth),
-    'flac': 0.5,
-    'ogg': 0.2,
-}
-
-
-def estimate_output_bytes(raw_bytes, fmt, args):
-    est = FORMAT_ESTIMATES.get(fmt, 1.0)
-    if callable(est):
-        return raw_bytes * est(args)
-    return raw_bytes * est
 
 
 def parse_args():
@@ -119,14 +103,14 @@ def parse_args():
     parser.add_argument('-s', '--size', type=int, default=DEFAULT_SIZE_LIMIT,
                         help='Max file size in bytes (default: 4000000000)')
     parser.add_argument('-m', '--max-recordings', type=int, default=DEFAULT_MAX_RECORDINGS,
-                        help='Max number of recording files to keep (default: 2)')
+                        help='Max number of recording files to keep (default: 4)')
     parser.add_argument('-b', '--bit-rate', type=int, default=DEFAULT_BIT_RATE,
-                        help='Bit rate in kbps for compressed formats (default: 128)')
+                        help='Bit rate in kbps for compressed formats (default: 320)')
     parser.add_argument('-d', '--bit-depth', type=int, default=DEFAULT_BIT_DEPTH,
                         choices=[8, 16, 24, 32],
                         help='Bit depth for recording (default: 16)')
     parser.add_argument('-r', '--sample-rate', type=int, default=DEFAULT_SAMPLE_RATE,
-                        help='Sample rate in Hz (default: 44100)')
+                        help='Sample rate in Hz (default: 48000)')
     parser.add_argument('-c', '--channels', type=int, default=DEFAULT_CHANNELS,
                         help='Number of audio channels (default: 2)')
     parser.add_argument('-l', '--length', type=int, default=DEFAULT_LENGTH,
@@ -135,7 +119,35 @@ def parse_args():
                         help='Directory for output files (default: current)')
     parser.add_argument('--device', default=None,
                         help='Audio input device name or index (default: default)')
+    parser.add_argument('--list-devices', action='store_true',
+                        help='List available audio input devices and exit')
     args = parser.parse_args()
+
+    if args.list_devices:
+        print(f'{ANSI["bold"]}Available audio input devices:{ANSI["reset"]}')
+        for i, dev in enumerate(sd.query_devices()):
+            if dev['max_input_channels'] > 0:
+                marker = f'{ANSI["green"]}*{ANSI["reset"]}' if i == sd.default.device[0] else ' '
+                print(f'  {marker} [{i}] {dev["name"]} ({dev["max_input_channels"]} ch, {int(dev["default_samplerate"])} Hz)')
+        sys.exit(0)
+
+    # Validate device if specified
+    if args.device is not None:
+        try:
+            dev_idx = sd.query_devices(args.device, 'input')
+        except (ValueError, OSError):
+            try:
+                dev_idx = sd.query_devices(int(args.device), 'input')
+            except (ValueError, OSError, IndexError):
+                print(f'Error: audio input device not found: {args.device}', file=sys.stderr)
+                sys.exit(1)
+        if dev_idx['max_input_channels'] < args.channels:
+            print(f'Error: device "{dev_idx["name"]}" has only {dev_idx["max_input_channels"]} input channels, {args.channels} requested', file=sys.stderr)
+            sys.exit(1)
+        # Check sample rate compatibility (allow close match)
+        default_sr = int(dev_idx['default_samplerate'])
+        if args.sample_rate != default_sr:
+            print(f'Warning: device default sample rate is {default_sr} Hz, using {args.sample_rate} Hz', file=sys.stderr)
 
     if args.output is None:
         ts = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
@@ -169,6 +181,64 @@ def fmt_time(s):
     m = (int(s) % 3600) // 60
     s = int(s) % 60
     return f'{h:02d}:{m:02d}:{s:02d}'
+
+
+def _readline_echo(prompt):
+    """Read a line with echo, cross-platform."""
+    import sys
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+    if HAS_MSVCRT:
+        # Windows: use msvcrt for character-by-character input
+        chars = []
+        while True:
+            ch = msvcrt.getwch()
+            if ch == '\r' or ch == '\n':
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+                break
+            elif ch == '\x08':  # Backspace
+                if chars:
+                    chars.pop()
+                    sys.stdout.write('\b \b')
+                    sys.stdout.flush()
+            elif ch >= ' ':
+                chars.append(ch)
+                sys.stdout.write(ch)
+                sys.stdout.flush()
+        return ''.join(chars)
+    else:
+        # Unix: use stdin.readline (blocks but that's fine for rename)
+        return sys.stdin.readline().rstrip('\n')
+
+
+def prompt_rename(cur_file, args):
+    """Prompt user to rename the current file."""
+    base = os.path.basename(cur_file)
+    # Remove extension
+    for fmt in SUPPORTED_FORMATS:
+        if base.lower().endswith(f'.{fmt}'):
+            base = base[:-(len(fmt) + 1)]
+            break
+    print(f'{ANSI["show_cursor"]}', end='')
+    print(f'{ANSI["clear"]}{ANSI["home"]}', end='')
+    print(f'{ANSI["cyan"]}{"=" * 54}{ANSI["reset"]}')
+    print(f'{ANSI["cyan"]}|{ANSI["reset"]}  {ANSI["bold"]}RENAME FILE{ANSI["reset"]}{" " * 39}{ANSI["cyan"]}|{ANSI["reset"]}')
+    print(f'{ANSI["cyan"]}+{"=" * 52}+{ANSI["reset"]}')
+    print(f'')
+    print(f'  Current: {ANSI["yellow"]}{base}{ANSI["reset"]}')
+    print(f'')
+    new_base = _readline_echo(f'  New name: {ANSI["cyan"]}')
+    print(f'{ANSI["reset"]}', end='')
+    print(f'{ANSI["hide_cursor"]}', end='')
+    if not new_base:
+        return os.path.basename(cur_file).split('.')[0]
+    # Remove any extension user might have typed
+    for fmt in SUPPORTED_FORMATS:
+        if new_base.lower().endswith(f'.{fmt}'):
+            new_base = new_base[:-(len(fmt) + 1)]
+            break
+    return new_base
 
 
 def get_disk_info(path='.'):
@@ -209,43 +279,43 @@ def next_filename(base, fmt, out_dir):
     return os.path.join(out_dir, f'{base}_{len(existing) + 1:04d}.{fmt}')
 
 
-def convert_wav(wav_path, out_path, fmt, br, sr, ch):
-    try:
-        subprocess.run(
-            ['ffmpeg', '-y', '-i', wav_path, '-b:a', f'{br}k',
-             '-ar', str(sr), '-ac', str(ch), out_path],
-            capture_output=True, check=True
-        )
-    except subprocess.CalledProcessError as e:
-        print(f'ffmpeg error: {e.stderr.decode()}', file=sys.stderr)
-        raise
-    except FileNotFoundError:
-        print('Error: ffmpeg not found. Install ffmpeg for MP3/FLAC/OGG.',
-              file=sys.stderr)
-        raise
+def pack_int24(data):
+    """Convert int32 array to int24 little-endian bytes (3 bytes per sample)."""
+    # data is int32, we need to take lower 24 bits and pack as 3 bytes LE
+    d = data.astype(np.int32)
+    # Extract 24 bits: (d & 0xFFFFFF).to_bytes(3, 'little') per sample
+    # Vectorized approach:
+    b0 = (d & 0xFF).astype(np.uint8)
+    b1 = ((d >> 8) & 0xFF).astype(np.uint8)
+    b2 = ((d >> 16) & 0xFF).astype(np.uint8)
+    # Interleave: b0, b1, b2, b0, b1, b2, ...
+    out = np.empty(d.size * 3, dtype=np.uint8)
+    out[0::3] = b0
+    out[1::3] = b1
+    out[2::3] = b2
+    return out.tobytes()
 
 
-def convert_temp_to_format(tmp_path, out_path, fmt, br, sr, ch, bd):
-    wp = tmp_path + '.wav'
-    wt = wave.open(wp, 'wb')
-    wt.setnchannels(ch)
-    wt.setsampwidth(bd // 8)
-    wt.setframerate(sr)
-    raw = open(tmp_path, 'rb').read()
-    if raw:
-        pd = np.frombuffer(raw, dtype=f'<i{bd // 8}').reshape(-1, ch)
-        wt.writeframes(pd.tobytes())
-    wt.close()
-    convert_wav(wp, out_path, fmt, br, sr, ch)
-    os.unlink(wp)
+def to_bytes_int24(data):
+    """Convert int32 array to int24 little-endian bytes for ffmpeg stdin."""
+    return pack_int24(data)
+
+
+def write_wav_frames(wf, data, bd):
+    """Write audio data to wave file, handling 24-bit correctly."""
+    if bd == 24:
+        wf.writeframes(pack_int24(data))
+    else:
+        wf.writeframes(data.tobytes())
 
 
 def apply_gain(data, gain):
     if gain == 1.0:
         return data
+    mn = np.iinfo(data.dtype).min
     mx = np.iinfo(data.dtype).max
     d = data.astype(np.float64) * gain
-    return np.clip(d, -mx, mx).astype(data.dtype)
+    return np.clip(d, mn, mx).astype(data.dtype)
 
 
 def rms_db(data, bit_depth):
@@ -261,8 +331,9 @@ class UIState:
     def __init__(self):
         self.running = True
         self.new_file = False
+        self.rename = False
         self.gain = 1.0
-        self.auto_gain = False
+        self.auto_gain = 0  # 0=off, 1=normal, 2=fast
         self.levels = []
         self.current_db = -100.0
         self.peak_db = -100.0
@@ -277,25 +348,48 @@ class UIState:
         return 20 * np.log10(self.gain) if self.gain > 0 else -100.0
 
     def read_key(self):
-        if not HAS_MSVCRT:
-            return
-        while msvcrt.kbhit():
-            k = msvcrt.getch()
-            if k in (b'q', b'Q'):
-                self.running = False
-            elif k in (b'n', b'N'):
-                self.new_file = True
-            elif k in (b'+', b'='):
-                self.gain = min(3.0, self.gain + 0.5)
-            elif k in (b'-', b'_'):
-                self.gain = max(0.1, self.gain - 0.5)
-            elif k in (b'a', b'A'):
-                self.auto_gain = not self.auto_gain
-            elif k in (b'B',):
-                self.blank = True
-            elif k in (b'b',):
-                self.blank = False
-                self._drawn = False
+        if HAS_MSVCRT:
+            while msvcrt.kbhit():
+                k = msvcrt.getch()
+                if k in (b'q', b'Q'):
+                    self.running = False
+                elif k in (b'n', b'N'):
+                    self.new_file = True
+                elif k in (b'+', b'='):
+                    self.gain = min(3.0, self.gain + 0.5)
+                elif k in (b'-', b'_'):
+                    self.gain = max(0.1, self.gain - 0.5)
+                elif k in (b'a', b'A'):
+                    self.auto_gain = (self.auto_gain + 1) % 3
+                elif k in (b'r', b'R'):
+                    self.rename = True
+                elif k in (b'B',):
+                    self.blank = True
+                elif k in (b'b',):
+                    self.blank = False
+                    self._drawn = False
+        else:
+            # Unix: use select for non-blocking stdin
+            import select
+            if select.select([sys.stdin], [], [], 0)[0]:
+                k = sys.stdin.read(1)
+                if k in ('q', 'Q'):
+                    self.running = False
+                elif k in ('n', 'N'):
+                    self.new_file = True
+                elif k in ('+', '='):
+                    self.gain = min(3.0, self.gain + 0.5)
+                elif k in ('-', '_'):
+                    self.gain = max(0.1, self.gain - 0.5)
+                elif k in ('a', 'A'):
+                    self.auto_gain = (self.auto_gain + 1) % 3
+                elif k in ('r', 'R'):
+                    self.rename = True
+                elif k in ('B',):
+                    self.blank = True
+                elif k in ('b',):
+                    self.blank = False
+                    self._drawn = False
 
 
 def draw_hud(S, args, cur_file, cur_size, size_lim, elapsed):
@@ -322,7 +416,12 @@ def draw_hud(S, args, cur_file, cur_size, size_lim, elapsed):
     bc = ANSI['green'] if p < 80 else ANSI['yellow'] if p < 95 else ANSI['red']
     lc = ANSI['green'] if S.current_db < -6 else ANSI['yellow'] if S.current_db < -3 else ANSI['red']
     pc = ANSI['green'] if S.peak_db < -3 else ANSI['yellow'] if S.peak_db < 0 else ANSI['red']
-    ac = ANSI['green'] if S.auto_gain else ANSI['dim']
+    if S.auto_gain == 2:
+        ac, ag_str = ANSI['red'], 'AUTO 2x'
+    elif S.auto_gain == 1:
+        ac, ag_str = ANSI['green'], 'AUTO'
+    else:
+        ac, ag_str = ANSI['dim'], 'OFF'
     cl = ANSI['red'] if S.clipping > 0 else ANSI['dim']
 
     lines = [
@@ -346,15 +445,15 @@ def draw_hud(S, args, cur_file, cur_size, size_lim, elapsed):
         f'  {ANSI["white"]}Level{ANSI["reset"]} [{lc}{lb}{ANSI["reset"]}] {lc}{S.current_db:.1f} dB{ANSI["reset"]}',
         f'  {ANSI["white"]}Peak{ANSI["reset"]}  [{pc}{lvl_bar(S.peak_db)}{ANSI["reset"]}] {pc}{S.peak_db:.1f} dB{ANSI["reset"]}',
         f'  {ANSI["white"]}Wave{ANSI["reset"]}  {ANSI["magenta"]}{sp}{ANSI["reset"]}',
-        f'  {ANSI["white"]}Gain{ANSI["reset"]}  {gc}+{gb:.1f} dB{ANSI["reset"]}  (x{S.gain:.1f})'
-        f'  {ac}AUTO:{S.auto_gain}{ANSI["reset"]}',
+        f'  {ANSI["white"]}Gain{ANSI["reset"]}  {gc}{gb:+.1f} dB{ANSI["reset"]}  (x{S.gain:.1f})'
+        f'  {ac}{ag_str}{ANSI["reset"]}',
         f'  {ANSI["white"]}Clip{ANSI["reset"]}  {cl}{S.clipping}{ANSI["reset"]}',
         '',
         f'  {ANSI["white"]}Time{ANSI["reset"]}  {ANSI["green"]}{fmt_time(elapsed)}{ANSI["reset"]}',
         f'  {ANSI["white"]}Total{ANSI["reset"]} {fmt_size(S.total_bytes)}',
         '',
         f'  {ANSI["green"]}[Q]{ANSI["reset"]}uit  {ANSI["cyan"]}[N]{ANSI["reset"]}ew File  {ANSI["yellow"]}[+]{ANSI["reset"]}/[-] Gain'
-        f'  {ANSI["magenta"]}[A]{ANSI["reset"]}utoGain  {ANSI["dim"]}Ctrl+C{ANSI["reset"]} Stop',
+        f'  {ANSI["magenta"]}[A]{ANSI["reset"]}utoGain  {ANSI["blue"]}[R]{ANSI["reset"]}ename  {ANSI["dim"]}Ctrl+C{ANSI["reset"]} Stop',
         f'{ANSI["cyan"]}{"-" * 54}{ANSI["reset"]}',
     ]
 
@@ -406,8 +505,9 @@ def record_wav(args):
     ch = args.channels
     md = args.length
 
-    cleanup_oldest(base, 'wav', out_dir, max_r)
-    cur_file = next_filename(base, 'wav', out_dir)
+    rotation_base = base  # constant for file rotation naming
+    cleanup_oldest(rotation_base, 'wav', out_dir, max_r)
+    cur_file = next_filename(rotation_base, 'wav', out_dir)
 
     draw_startup(args)
     print(ANSI['hide_cursor'], end='')
@@ -422,7 +522,8 @@ def record_wav(args):
         wf.setframerate(sr)
 
         bs = int(sr * CHUNK_DURATION)
-        dt = f'int{bd}'
+        dt = get_audio_dtype(bd)
+        cur_file_size = 0
 
         with sd.InputStream(samplerate=sr, channels=ch, dtype=dt, blocksize=bs,
                             device=args.device) as stream:
@@ -431,16 +532,16 @@ def record_wav(args):
                 if md > 0 and el >= md:
                     break
 
-                cs = os.path.getsize(cur_file) if os.path.exists(cur_file) else 0
-                if cs >= size_lim:
+                if cur_file_size >= size_lim:
                     wf.close()
-                    cleanup_oldest(base, 'wav', out_dir, max_r)
-                    cur_file = next_filename(base, 'wav', out_dir)
+                    cleanup_oldest(rotation_base, 'wav', out_dir, max_r)
+                    cur_file = next_filename(rotation_base, 'wav', out_dir)
                     wf = wave.open(cur_file, 'wb')
                     wf.setnchannels(ch)
                     wf.setsampwidth(bd // 8)
                     wf.setframerate(sr)
-                    cs = 0
+                    cur_file_size = 0
+                    st.clipping = 0
                     st._drawn = False
                     continue
 
@@ -458,10 +559,11 @@ def record_wav(args):
 
                 if st.auto_gain and peak > 0:
                     target_peak = mx * 0.8
+                    rate = 0.02 if st.auto_gain == 2 else 0.01
                     if peak < target_peak:
-                        st.gain = min(3.0, st.gain * 1.01)
+                        st.gain = min(3.0, st.gain * (1.0 + rate))
                     elif peak > target_peak * 1.1:
-                        st.gain = max(0.1, st.gain * 0.99)
+                        st.gain = max(0.1, st.gain * (1.0 - rate))
 
                 data = apply_gain(data, st.gain)
                 db = rms_db(data, bd)
@@ -470,21 +572,44 @@ def record_wav(args):
                 if len(st.levels) > 40:
                     st.levels.pop(0)
 
-                wf.writeframes(data.tobytes())
-                st.total_bytes += len(data.tobytes())
+                write_wav_frames(wf, data, bd)
+                # 24-bit writes 3 bytes/sample; int32 container gives 4
+                frame_bytes = data.size * 3 if bd == 24 else len(data.tobytes())
+                cur_file_size += frame_bytes
+                st.total_bytes += frame_bytes
 
                 st.read_key()
-                draw_hud(st, args, cur_file, cs + len(data.tobytes()), size_lim, el)
+                draw_hud(st, args, cur_file, cur_file_size, size_lim, el)
 
                 if st.new_file:
                     wf.close()
-                    cleanup_oldest(base, 'wav', out_dir, max_r)
-                    cur_file = next_filename(base, 'wav', out_dir)
+                    cleanup_oldest(rotation_base, 'wav', out_dir, max_r)
+                    cur_file = next_filename(rotation_base, 'wav', out_dir)
                     wf = wave.open(cur_file, 'wb')
                     wf.setnchannels(ch)
                     wf.setsampwidth(bd // 8)
                     wf.setframerate(sr)
                     st.new_file = False
+                    st.clipping = 0
+                    cur_file_size = 0
+                    st._drawn = False
+                    t0 = time.time()
+
+                if st.rename:
+                    wf.close()
+                    new_base = prompt_rename(cur_file, args)
+                    if new_base != base:
+                        base = new_base
+                        rotation_base = new_base
+                    cleanup_oldest(rotation_base, 'wav', out_dir, max_r)
+                    cur_file = next_filename(rotation_base, 'wav', out_dir)
+                    wf = wave.open(cur_file, 'wb')
+                    wf.setnchannels(ch)
+                    wf.setsampwidth(bd // 8)
+                    wf.setframerate(sr)
+                    st.rename = False
+                    st.clipping = 0
+                    cur_file_size = 0
                     st._drawn = False
                     t0 = time.time()
 
@@ -496,6 +621,48 @@ def record_wav(args):
         print(f'{ANSI["show_cursor"]}', end='')
         print(f'\n{ANSI["green"]}Recording stopped.{ANSI["reset"]}')
         print(f'{ANSI["dim"]}Total: {fmt_size(st.total_bytes)}{ANSI["reset"]}')
+
+
+def get_audio_dtype(bd):
+    """Return numpy dtype for given bit depth."""
+    if bd == 8:
+        return np.int8
+    elif bd == 16:
+        return np.int16
+    elif bd == 24:
+        return np.int32  # 24-bit stored in 32-bit int
+    elif bd == 32:
+        return np.int32
+    return np.int16
+
+
+def get_ffmpeg_fmt(bd):
+    """Return ffmpeg input format for given bit depth."""
+    if bd == 8:
+        return 's8'
+    elif bd == 16:
+        return 's16le'
+    elif bd == 24:
+        return 's24le'
+    elif bd == 32:
+        return 's32le'
+    return 's16le'
+
+
+def build_ffmpeg_cmd(fmt, out_path, br, sr, ch, bd):
+    """Build ffmpeg command for streaming encoding."""
+    infmt = get_ffmpeg_fmt(bd)
+    if fmt == 'mp3':
+        return ['ffmpeg', '-y', '-f', infmt, '-ar', str(sr), '-ac', str(ch), '-i', '-',
+                '-c:a', 'libmp3lame', '-b:a', f'{br}k', out_path]
+    elif fmt == 'flac':
+        return ['ffmpeg', '-y', '-f', infmt, '-ar', str(sr), '-ac', str(ch), '-i', '-',
+                '-c:a', 'flac', '-compression_level', '5', out_path]
+    elif fmt == 'ogg':
+        return ['ffmpeg', '-y', '-f', infmt, '-ar', str(sr), '-ac', str(ch), '-i', '-',
+                '-c:a', 'libvorbis', '-b:a', f'{br}k', out_path]
+    else:
+        raise ValueError(f'Unsupported format: {fmt}')
 
 
 def record_compressed(args):
@@ -511,23 +678,48 @@ def record_compressed(args):
     md = args.length
     fmt = args.file_format
 
-    cleanup_oldest(base, fmt, out_dir, max_r)
-    cur_file = next_filename(base, fmt, out_dir)
+    rotation_base = base  # constant for file rotation naming
+    cleanup_oldest(rotation_base, fmt, out_dir, max_r)
+    cur_file = next_filename(rotation_base, fmt, out_dir)
 
     draw_startup(args)
     print(ANSI['hide_cursor'], end='')
 
-    tmp_path = None
     t0 = time.time()
-    raw_bytes = 0
-    tmp_fp = None
+    ffmpeg_proc = None
+
+    def start_ffmpeg(path):
+        nonlocal ffmpeg_proc
+        if ffmpeg_proc:
+            ffmpeg_proc.stdin.close()
+            ffmpeg_proc.wait()
+        cmd = build_ffmpeg_cmd(fmt, path, br, sr, ch, bd)
+        ffmpeg_proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        # Verify ffmpeg started successfully
+        time.sleep(0.05)
+        if ffmpeg_proc.poll() is not None:
+            raise RuntimeError(f'ffmpeg failed to start (exit code: {ffmpeg_proc.returncode})')
+
+    def stop_ffmpeg():
+        nonlocal ffmpeg_proc
+        if ffmpeg_proc:
+            try:
+                ffmpeg_proc.stdin.close()
+            except (BrokenPipeError, OSError):
+                pass
+            try:
+                ffmpeg_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                ffmpeg_proc.kill()
+                ffmpeg_proc.wait()
+            ffmpeg_proc = None
 
     try:
-        tmp_path = tempfile.mktemp(suffix='.raw')
-        tmp_fp = open(tmp_path, 'wb')
+        start_ffmpeg(cur_file)
 
         bs = int(sr * CHUNK_DURATION)
-        dt = f'int{bd}'
+        dt = get_audio_dtype(bd)
+        cur_file_size = 0
 
         with sd.InputStream(samplerate=sr, channels=ch, dtype=dt, blocksize=bs,
                             device=args.device) as stream:
@@ -536,30 +728,27 @@ def record_compressed(args):
                 if md > 0 and el >= md:
                     break
 
-                est_out = estimate_output_bytes(raw_bytes, fmt, args)
-                if est_out >= size_lim:
-                    tmp_fp.close()
-                    convert_temp_to_format(tmp_path, cur_file, fmt, br, sr, ch, bd)
-                    st.total_bytes += os.path.getsize(cur_file)
+                est_size = int(estimate_output_bytes(cur_file_size, fmt, args))
+                if est_size >= size_lim:
+                    stop_ffmpeg()
+                    st.total_bytes += cur_file_size
+                    cur_file_size = 0  # reset before continue to prevent infinite rotation
 
-                    open(tmp_path, 'wb').close()
-                    raw_bytes = 0
-                    tmp_fp = open(tmp_path, 'ab')
-
-                    cleanup_oldest(base, fmt, out_dir, max_r)
-                    cur_file = next_filename(base, fmt, out_dir)
+                    cleanup_oldest(rotation_base, fmt, out_dir, max_r)
+                    cur_file = next_filename(rotation_base, fmt, out_dir)
                     st._drawn = False
+
+                    start_ffmpeg(cur_file)
 
                     st.read_key()
                     draw_hud(st, args, cur_file, 0, size_lim, el)
 
                     if st.new_file:
-                        tmp_fp.close()
-                        open(tmp_path, 'wb').close()
-                        raw_bytes = 0
-                        tmp_fp = open(tmp_path, 'ab')
+                        stop_ffmpeg()
                         st.new_file = False
+                        st.clipping = 0
                         t0 = time.time()
+                        start_ffmpeg(cur_file)
                     continue
 
                 data, ov = stream.read(bs)
@@ -576,10 +765,11 @@ def record_compressed(args):
 
                 if st.auto_gain and peak > 0:
                     target_peak = mx * 0.8
+                    rate = 0.02 if st.auto_gain == 2 else 0.01
                     if peak < target_peak:
-                        st.gain = min(3.0, st.gain * 1.01)
+                        st.gain = min(3.0, st.gain * (1.0 + rate))
                     elif peak > target_peak * 1.1:
-                        st.gain = max(0.1, st.gain * 0.99)
+                        st.gain = max(0.1, st.gain * (1.0 - rate))
 
                 data = apply_gain(data, st.gain)
                 db = rms_db(data, bd)
@@ -588,46 +778,73 @@ def record_compressed(args):
                 if len(st.levels) > 40:
                     st.levels.pop(0)
 
-                tmp_fp.write(data.tobytes())
-                tmp_fp.flush()
-                raw_bytes += len(data.tobytes())
+                # Write to ffmpeg stdin with error handling
+                try:
+                    if ffmpeg_proc and ffmpeg_proc.poll() is None:
+                        if bd == 24:
+                            frame_bytes = len(to_bytes_int24(data))
+                            ffmpeg_proc.stdin.write(to_bytes_int24(data))
+                        else:
+                            frame_bytes = len(data.tobytes())
+                            ffmpeg_proc.stdin.write(data.tobytes())
+                        ffmpeg_proc.stdin.flush()
+                        cur_file_size += frame_bytes
+                    else:
+                        # ffmpeg died, restart
+                        raise BrokenPipeError('ffmpeg process died')
+                except (BrokenPipeError, OSError) as e:
+                    print(f'ffmpeg write error: {e}', file=sys.stderr)
+                    # Attempt to restart ffmpeg
+                    try:
+                        stop_ffmpeg()
+                        start_ffmpeg(cur_file)
+                    except Exception as re:
+                        print(f'Failed to restart ffmpeg: {re}', file=sys.stderr)
+                        st.running = False
+                        break
 
                 st.read_key()
-                draw_hud(st, args, cur_file, est_out, size_lim, el)
+                draw_hud(st, args, cur_file,
+                         int(estimate_output_bytes(cur_file_size, fmt, args)),
+                         size_lim, el)
 
                 if st.new_file:
-                    tmp_fp.close()
-                    convert_temp_to_format(tmp_path, cur_file, fmt, br, sr, ch, bd)
-                    st.total_bytes += os.path.getsize(cur_file)
+                    stop_ffmpeg()
+                    st.total_bytes += cur_file_size
 
-                    open(tmp_path, 'wb').close()
-                    raw_bytes = 0
-                    tmp_fp = open(tmp_path, 'ab')
-
-                    cleanup_oldest(base, fmt, out_dir, max_r)
-                    cur_file = next_filename(base, fmt, out_dir)
+                    cleanup_oldest(rotation_base, fmt, out_dir, max_r)
+                    cur_file = next_filename(rotation_base, fmt, out_dir)
                     st.new_file = False
+                    st.clipping = 0
+                    cur_file_size = 0
                     st._drawn = False
                     t0 = time.time()
+                    start_ffmpeg(cur_file)
 
-        tmp_fp.close()
-        if os.path.exists(tmp_path) and os.path.getsize(tmp_path) > 0:
-            convert_temp_to_format(tmp_path, cur_file, fmt, br, sr, ch, bd)
-            st.total_bytes += os.path.getsize(cur_file)
+                if st.rename:
+                    stop_ffmpeg()
+                    st.total_bytes += cur_file_size
+                    new_base = prompt_rename(cur_file, args)
+                    if new_base != base:
+                        base = new_base
+                        rotation_base = new_base
+                    cleanup_oldest(rotation_base, fmt, out_dir, max_r)
+                    cur_file = next_filename(rotation_base, fmt, out_dir)
+                    start_ffmpeg(cur_file)
+                    st.rename = False
+                    st.clipping = 0
+                    cur_file_size = 0
+                    st._drawn = False
+                    t0 = time.time()
 
     except KeyboardInterrupt:
         pass
     except Exception:
-        if tmp_fp:
-            tmp_fp.close()
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        stop_ffmpeg()
         raise
     finally:
-        if tmp_fp:
-            tmp_fp.close()
-        if tmp_path and os.path.exists(tmp_path):
-            os.unlink(tmp_path)
+        stop_ffmpeg()
+        st.total_bytes += cur_file_size
         print(f'{ANSI["show_cursor"]}', end='')
         print(f'\n{ANSI["green"]}Recording stopped.{ANSI["reset"]}')
         print(f'{ANSI["dim"]}Total: {fmt_size(st.total_bytes)}{ANSI["reset"]}')
