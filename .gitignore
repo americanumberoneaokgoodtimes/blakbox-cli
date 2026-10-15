@@ -5,3 +5,15 @@
 *.raw
 __pycache__/
 *.pyc
+*.pyo
+.pytest_cache/
+# Transcription / translation output artifacts
+* (transcribed on *.txt
+* (translated on *.txt
+# Legacy versions
+blakbox1.0.py
+# Build artifacts
+build/
+dist/
+*.spec
+*.exe
