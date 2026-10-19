@@ -87,7 +87,7 @@ jobs:
 
       - name: Build executable
         run: |
-          python -m PyInstaller --onefile --name blakbox audio_recorder.py --clean
+          python -m PyInstaller --onefile --name blakbox audio_recorder.py --clean --noconfirm
 
       - name: Rename artifact
         run: |

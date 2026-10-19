@@ -58,6 +58,7 @@ def build():
         '--onefile',
         '--name', 'blakbox',
         '--clean',
+        '--noconfirm',
         'audio_recorder.py'
     ]
 

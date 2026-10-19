@@ -78,6 +78,9 @@ Live display during recording:
 | `Q` | Quit recording |
 | `N` | Start new file (rotate now) |
 | `R` | Rename current file base name |
+| `D` | Select audio input device (triggers new file rotation) |
+| `M` | Toggle headphone monitor mode (interactive output device list) |
+| `P` | Pause / resume recording |
 | `+` | Increase gain (+0.5x) |
 | `-` | Decrease gain (-0.5x) |
 | `0` | Reset gain to unity (0 dB, ×1.00) |
