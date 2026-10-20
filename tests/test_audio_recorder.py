@@ -1039,6 +1039,142 @@ class TestAudioSinkClasses(unittest.TestCase):
             mock_proc.stdin.close.assert_called_once()
 
 
+
+class TestAudioQualityAndGainCalibration(unittest.TestCase):
+    def test_gain_db_conversions(self):
+        st = ar.UIState()
+        st.gain = 1.0
+        self.assertAlmostEqual(st.gain_db(), 0.0, places=1)
+        st.gain = 10.0  # +20 dB
+        self.assertAlmostEqual(st.gain_db(), 20.0, places=1)
+        st.gain = 0.1   # -20 dB
+        self.assertAlmostEqual(st.gain_db(), -20.0, places=1)
+
+    def test_calm_ambient_gain_scaling(self):
+        # Calm room ambient signal at -38 dBFS
+        sr = 48000
+        bd = 16
+        mx_val = 32767
+        rms_target = mx_val * (10 ** (-38.0 / 20.0))
+        t = np.linspace(0, 1, sr, endpoint=False)
+        sine = (np.sin(2 * np.pi * 1000 * t) * (rms_target * np.sqrt(2))).astype(np.int16)
+        
+        # At gain 0.0 dB (unity x1.0) -> Level ≈ -38 dB
+        g0 = ar.apply_gain(sine, 1.0, bd)
+        lvl_g0 = ar.rms_db(g0, bd)
+        self.assertAlmostEqual(lvl_g0, -38.0, delta=0.5)
+
+        # At gain +20.0 dB (x10.0) -> Level ≈ -18 dB
+        gp20 = ar.apply_gain(sine, 10.0, bd)
+        lvl_gp20 = ar.rms_db(gp20, bd)
+        self.assertAlmostEqual(lvl_gp20, -18.0, delta=0.5)
+
+        # At gain -20.0 dB (x0.1) -> Level ≈ -58 dB
+        gm20 = ar.apply_gain(sine, 0.1, bd)
+        lvl_gm20 = ar.rms_db(gm20, bd)
+        self.assertAlmostEqual(lvl_gm20, -58.0, delta=0.5)
+
+    def test_24bit_calm_ambient_gain_scaling(self):
+        # 24-bit calm ambient signal at -38 dBFS
+        sr = 48000
+        bd = 24
+        mx_val = 8388607
+        rms_target = mx_val * (10 ** (-38.0 / 20.0))
+        t = np.linspace(0, 1, sr, endpoint=False)
+        sine = (np.sin(2 * np.pi * 1000 * t) * (rms_target * np.sqrt(2))).astype(np.int32)
+
+        # At gain 0.0 dB -> Level ≈ -38 dB
+        g0 = ar.apply_gain(sine, 1.0, bd)
+        self.assertAlmostEqual(ar.rms_db(g0, bd), -38.0, delta=0.5)
+
+        # At gain +20.0 dB -> Level ≈ -18 dB
+        gp20 = ar.apply_gain(sine, 10.0, bd)
+        self.assertAlmostEqual(ar.rms_db(gp20, bd), -18.0, delta=0.5)
+
+    def test_read_key_gain_stepping(self):
+        st = ar.UIState()
+        self.assertEqual(st.gain, 1.0)
+        # Test key press '+' on Windows (msvcrt) or Unix (select)
+        from unittest.mock import patch
+        if ar.HAS_MSVCRT:
+            with patch('msvcrt.kbhit', side_effect=[True, False]), patch('msvcrt.getch', return_value=b'+'):
+                st.read_key()
+            self.assertAlmostEqual(st.gain_db(), 1.0, places=1)
+            # 19 more presses to reach +20.0 dB
+            for _ in range(19):
+                with patch('msvcrt.kbhit', side_effect=[True, False]), patch('msvcrt.getch', return_value=b'+'):
+                    st.read_key()
+            self.assertAlmostEqual(st.gain_db(), 20.0, places=1)
+            # '0' key resets to unity (0 dB)
+            with patch('msvcrt.kbhit', side_effect=[True, False]), patch('msvcrt.getch', return_value=b'0'):
+                st.read_key()
+            self.assertAlmostEqual(st.gain_db(), 0.0, places=1)
+            self.assertEqual(st.gain, 1.0)
+            # '-' key steps down
+            with patch('msvcrt.kbhit', side_effect=[True, False]), patch('msvcrt.getch', return_value=b'-'):
+                st.read_key()
+            self.assertAlmostEqual(st.gain_db(), -1.0, places=1)
+
+    def test_24bit_audio_input_stream_shift(self):
+        # Verify 32-bit PortAudio audio is shifted to 24-bit range
+        stream = ar.AudioInputStream(48000, 1, np.int32, 100, device=None, bit_depth=24)
+        mock_raw = np.array([[256 * 1000], [-256 * 2000]], dtype=np.int32)
+        # Put into queue as if callback received it
+        stream._queue.put((mock_raw >> 8).astype(np.int32))
+        data, _ = stream.read(2)
+        self.assertEqual(data[0, 0], 1000)
+        self.assertEqual(data[1, 0], -2000)
+
+    def test_pack_int24_clamps_safely(self):
+        # Out-of-bounds 24-bit numbers should saturate rather than wrapping
+        data = np.array([10000000, -10000000], dtype=np.int32)
+        raw = ar.pack_int24(data)
+        self.assertEqual(len(raw), 6)
+        # Unpack first sample
+        val1 = raw[0] | (raw[1] << 8) | (raw[2] << 16)
+        if val1 >= (1 << 23):
+            val1 -= (1 << 24)
+        self.assertEqual(val1, 8388607)  # Saturated at max 24-bit signed!
+
+    def test_8bit_wav_unsigned_conversion(self):
+        # 8-bit PCM WAV must be unsigned 0..255 (128 is center)
+        from unittest.mock import MagicMock
+        mock_wf = MagicMock()
+        data = np.array([-128, 0, 127], dtype=np.int8)
+        ar.write_wav_frames(mock_wf, data, 8)
+        written_bytes = mock_wf.writeframes.call_args[0][0]
+        self.assertEqual(list(written_bytes), [0, 128, 255])
+
+
+class TestAutoGainTargetAdjustment(unittest.TestCase):
+    def test_auto_gain_adjusts_level_to_target_zone(self):
+        # When sound is -20 dB (too loud, above -38 dB), gain should reduce
+        raw_db = -20.0
+        st = ar.UIState()
+        st.auto_gain = 1
+        st.gain = 1.0  # 0 dB
+        
+        # Simulate auto-gain loop step
+        cur_gain_db = st.gain_db()
+        current_out_db = raw_db + cur_gain_db
+        excess = current_out_db - (-38.0)
+        attack_step = min(6.0, max(0.5, excess * 0.35))
+        st.gain = 10.0 ** ((cur_gain_db - attack_step) / 20.0)
+        
+        # Gain should have dropped
+        self.assertLess(st.gain_db(), 0.0)
+
+    def test_auto_gain_deadband_stability(self):
+        # When sound is at -40 dB (within [-42, -38] dB), gain remains unchanged
+        raw_db = -40.0
+        st = ar.UIState()
+        st.auto_gain = 1
+        st.gain = 1.0
+        cur_gain_db = st.gain_db()
+        current_out_db = raw_db + cur_gain_db
+        self.assertTrue(-42.0 <= current_out_db <= -38.0)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
 

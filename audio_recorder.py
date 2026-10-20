@@ -845,22 +845,27 @@ def open_monitor_stream(sr, ch, dt, device=None):
     raise RuntimeError('Could not open output audio device for monitoring')
 
 
-def write_monitor_audio(monitor_stream, monitor_channels, data):
-    """Write audio data to monitor stream, adjusting channel layout if needed."""
+def write_monitor_audio(monitor_stream, monitor_channels, data, bit_depth=16):
+    """Write audio data to monitor stream, adjusting channel layout and bit-depth if needed."""
     if monitor_stream is None:
         return
-    if data.ndim == 1:
-        if monitor_channels == 2:
-            mdata = np.column_stack([data, data])
-        else:
-            mdata = data
+    # If 24-bit audio in int32 container, shift left to full 32-bit for PortAudio output
+    if bit_depth == 24 and data.dtype == np.int32:
+        mdata = (data.astype(np.int64) << 8).clip(-2147483648, 2147483647).astype(np.int32)
     else:
-        if monitor_channels == 2 and data.shape[1] == 1:
-            mdata = np.repeat(data, 2, axis=1)
-        elif monitor_channels == 1 and data.shape[1] > 1:
-            mdata = data[:, :1]
+        mdata = data
+    if mdata.ndim == 1:
+        if monitor_channels == 2:
+            mdata = np.column_stack([mdata, mdata])
         else:
-            mdata = data
+            mdata = mdata
+    else:
+        if monitor_channels == 2 and mdata.shape[1] == 1:
+            mdata = np.repeat(mdata, 2, axis=1)
+        elif monitor_channels == 1 and mdata.shape[1] > 1:
+            mdata = mdata[:, :1]
+        else:
+            mdata = mdata
     monitor_stream.write(mdata)
 
 
@@ -869,11 +874,12 @@ class AudioInputStream:
     Provides identical API to sd.InputStream (read, start, stop, close, context manager)
     while working on all host APIs including Windows WDM-KS (where blocking read() fails).
     """
-    def __init__(self, samplerate, channels, dtype, blocksize, device=None):
+    def __init__(self, samplerate, channels, dtype, blocksize, device=None, bit_depth=16):
         self.samplerate = samplerate
         self.channels = channels
         self.dtype = dtype
         self.blocksize = blocksize
+        self.bit_depth = bit_depth
         if isinstance(device, str):
             try:
                 device = int(device)
@@ -890,7 +896,10 @@ class AudioInputStream:
                 self._overflow = True
                 self._drops += 1
             if not self._paused:
-                self._queue.put(indata.copy())
+                chunk = indata.copy()
+                if self.bit_depth == 24 and chunk.dtype == np.int32:
+                    chunk = (chunk >> 8).astype(np.int32)
+                self._queue.put(chunk)
 
         self._stream = sd.InputStream(
             samplerate=samplerate,
@@ -1005,7 +1014,7 @@ def handle_device_switch(st, args, current_stream, sr, ch, dt, bs):
 
     try:
         new_stream = AudioInputStream(samplerate=target_sr, channels=target_ch, dtype=dt,
-                                      blocksize=target_bs, device=new_dev)
+                                      blocksize=target_bs, device=new_dev, bit_depth=args.bit_depth)
         new_stream.start()
         args.device = new_dev
         args.channels = target_ch
@@ -1019,7 +1028,7 @@ def handle_device_switch(st, args, current_stream, sr, ch, dt, bs):
         st.error_msg = f'Failed to switch device: {exc}'
         try:
             restored_stream = AudioInputStream(samplerate=sr, channels=ch, dtype=dt,
-                                                blocksize=bs, device=args.device)
+                                                blocksize=bs, device=args.device, bit_depth=args.bit_depth)
             restored_stream.start()
             return restored_stream
         except Exception:
@@ -1161,8 +1170,8 @@ def next_filename(base, fmt, out_dir):
 # ---------------------------------------------------------------------------
 
 def pack_int24(data):
-    """Convert int32 array to 24-bit little-endian byte string (3 bytes/sample)."""
-    d = np.asarray(data).reshape(-1).astype(np.int32)
+    """Convert int32 array (24-bit signed values) to 24-bit little-endian byte string (3 bytes/sample)."""
+    d = np.clip(np.nan_to_num(np.asarray(data).reshape(-1), nan=0.0), -8388608, 8388607).astype(np.int32)
     b0 = (d & 0xFF).astype(np.uint8)
     b1 = ((d >> 8) & 0xFF).astype(np.uint8)
     b2 = ((d >> 16) & 0xFF).astype(np.uint8)
@@ -1174,29 +1183,37 @@ def pack_int24(data):
 
 
 def write_wav_frames(wf, data, bd):
-    """Write audio frames to an open wave.Wave_write, handling 24-bit correctly."""
+    """Write audio frames to an open wave.Wave_write, handling 8-bit and 24-bit correctly."""
     if bd == 24:
         wf.writeframes(pack_int24(data))
+    elif bd == 8:
+        # Standard WAV 8-bit PCM is unsigned uint8 (0-255, 128 = silence)
+        u8_data = np.clip(data.astype(np.int16) + 128, 0, 255).astype(np.uint8)
+        wf.writeframes(u8_data.tobytes())
     else:
         wf.writeframes(data.tobytes())
 
 
-def apply_gain(data, gain):
+def apply_gain(data, gain, bit_depth=None):
     if gain == 1.0:
         return data
-    mn = np.iinfo(data.dtype).min
-    mx = np.iinfo(data.dtype).max
-    d = data.astype(np.float64) * gain
+    if bit_depth is not None and bit_depth in (8, 16, 24, 32):
+        mn = -(2 ** (bit_depth - 1))
+        mx = (2 ** (bit_depth - 1)) - 1
+    else:
+        mn = np.iinfo(data.dtype).min
+        mx = np.iinfo(data.dtype).max
+    d = np.nan_to_num(data.astype(np.float64) * gain, nan=0.0)
     return np.clip(d, mn, mx).astype(data.dtype)
 
 
 def rms_db(data, bit_depth):
     if len(data) == 0:
         return -100.0
-    mx = 2 ** (bit_depth - 1)
+    mx = float(2 ** (bit_depth - 1))
     f = data.astype(np.float64) / mx
     r = np.sqrt(np.mean(f ** 2))
-    return 20 * np.log10(r) if r > 1e-10 else -100.0
+    return 20.0 * np.log10(r) if r > 1e-10 else -100.0
 
 
 def get_audio_dtype(bd):
@@ -1271,11 +1288,15 @@ class UIState:
                 elif k in (b'n', b'N'):
                     self.new_file = True
                 elif k in (b'+', b'='):
-                    self.gain = min(3.0, self.gain + 0.5)
+                    cur_db = round(self.gain_db(), 1)
+                    new_db = min(30.0, cur_db + 1.0)
+                    self.gain = 10.0 ** (new_db / 20.0)
                 elif k in (b'-', b'_'):
-                    self.gain = max(0.1, self.gain - 0.5)
+                    cur_db = round(self.gain_db(), 1)
+                    new_db = max(-30.0, cur_db - 1.0)
+                    self.gain = 10.0 ** (new_db / 20.0)
                 elif k == b'0':
-                    self.gain = 1.0          # reset to unity (BUG-12)
+                    self.gain = 1.0          # reset to unity (0 dB)
                 elif k in (b'a', b'A'):
                     self.auto_gain = (self.auto_gain + 1) % 3
                 elif k in (b'r', b'R'):
@@ -1300,9 +1321,13 @@ class UIState:
                     elif k in ('n', 'N'):
                         self.new_file = True
                     elif k in ('+', '='):
-                        self.gain = min(3.0, self.gain + 0.5)
+                        cur_db = round(self.gain_db(), 1)
+                        new_db = min(30.0, cur_db + 1.0)
+                        self.gain = 10.0 ** (new_db / 20.0)
                     elif k in ('-', '_'):
-                        self.gain = max(0.1, self.gain - 0.5)
+                        cur_db = round(self.gain_db(), 1)
+                        new_db = max(-30.0, cur_db - 1.0)
+                        self.gain = 10.0 ** (new_db / 20.0)
                     elif k == '0':
                         self.gain = 1.0
                     elif k in ('a', 'A'):
@@ -1374,7 +1399,7 @@ def draw_hud(S, args, cur_file, cur_size, size_lim, elapsed, total_override=None
     lb = lvl_bar(S.current_db)
     sp = sparkline(S.levels)
     gb = S.gain_db()
-    gc = ANSI['red'] if abs(gb) > 12 else ANSI['yellow'] if abs(gb) > 6 else ANSI['green']
+    gc = ANSI['red'] if abs(gb) > 24 else ANSI['yellow'] if abs(gb) > 12 else ANSI['green']
     bc = ANSI['green'] if size_frac < 0.80 else ANSI['yellow'] if size_frac < 0.95 else ANSI['red']
     lc = ANSI['green'] if S.current_db < -6 else ANSI['yellow'] if S.current_db < -3 else ANSI['red']
     pc = ANSI['green'] if S.peak_db < -3 else ANSI['yellow'] if S.peak_db < 0 else ANSI['red']
@@ -1535,7 +1560,8 @@ def test_audio_device(args):
                 pass
 
         with AudioInputStream(samplerate=args.sample_rate, channels=args.channels,
-                              dtype=dt, blocksize=bs, device=args.device) as stream:
+                              dtype=dt, blocksize=bs, device=args.device,
+                              bit_depth=args.bit_depth) as stream:
             stream.read(bs)
         return True, None
     except Exception as e:
@@ -1725,7 +1751,7 @@ def record_engine(args, sink):
             dt = get_audio_dtype(bd)
 
             stream = AudioInputStream(samplerate=sr, channels=ch, dtype=dt, blocksize=bs,
-                                      device=args.device)
+                                      device=args.device, bit_depth=bd)
             stream.start()
             monitor_stream = None
             monitor_channels = ch
@@ -1787,24 +1813,50 @@ def record_engine(args, sink):
                     if ov:
                         st.drops += 1
 
-                    mx_val = np.iinfo(data.dtype).max
-                    peak = np.max(np.abs(data))
-                    st.peak_db = 20 * np.log10(peak / mx_val) if peak > 0 else -100.0
-                    st.clipping += int(np.sum(np.abs(data) >= mx_val * 0.999))
+                    # Ensure 24-bit audio in int32 container is properly scaled if mock/direct stream was used
+                    if bd == 24 and data.dtype == np.int32 and (np.max(np.abs(data)) > 8388607):
+                        data = (data >> 8).astype(np.int32)
 
-                    if st.auto_gain and peak > 0:
-                        target = mx_val * 0.8
-                        rate = 0.02 if st.auto_gain == 2 else 0.01
-                        if peak < target:
-                            st.gain = min(3.0, st.gain * (1.0 + rate))
-                        elif peak > target * 1.1:
-                            attack_rate = rate * 4
-                            st.gain = max(0.1, st.gain * (1.0 - attack_rate))
+                    # Determine input level for Auto Gain
+                    raw_db = rms_db(data, bd)
 
-                    data = apply_gain(data, st.gain)
+                    # Auto Gain control
+                    # Targets recorded Level near -38 to -42 dBFS (center: -40 dBFS)
+                    if st.auto_gain and raw_db > -65.0:
+                        cur_gain_db = st.gain_db()
+                        current_out_db = raw_db + cur_gain_db
+                        speed = 2.0 if st.auto_gain == 2 else 1.0
+
+                        # Too loud (> -38 dB): attack (reduce gain)
+                        if current_out_db > -38.0:
+                            excess = current_out_db - (-38.0)
+                            attack_step = min(6.0, max(0.5, excess * 0.35 * speed))
+                            new_gain_db = max(-30.0, cur_gain_db - attack_step)
+                            st.gain = 10.0 ** (new_gain_db / 20.0)
+                        # Too quiet (< -42 dB): release (increase gain)
+                        elif current_out_db < -42.0:
+                            deficit = (-42.0) - current_out_db
+                            release_step = min(2.5, max(0.2, deficit * 0.15 * speed))
+                            new_gain_db = min(30.0, cur_gain_db + release_step)
+                            st.gain = 10.0 ** (new_gain_db / 20.0)
+
+                    # Apply gain to recorded audio
+                    data = apply_gain(data, st.gain, bd)
+
+                    # Measure output metrics on actual recorded audio
+                    mx_val = (2 ** (bd - 1)) - 1
+                    peak = np.max(np.abs(data)) if len(data) > 0 else 0
+                    st.peak_db = 20.0 * np.log10(peak / mx_val) if peak > 0 else -100.0
+                    clip_count = int(np.sum(np.abs(data) >= mx_val * 0.999))
+                    st.clipping += clip_count
+                    if clip_count > 0 and st.auto_gain:
+                        # Rapid limiter backoff on hard clip
+                        cur_gain_db = max(-30.0, st.gain_db() - 3.0)
+                        st.gain = 10.0 ** (cur_gain_db / 20.0)
+
                     if st.monitor and monitor_stream is not None:
                         try:
-                            write_monitor_audio(monitor_stream, monitor_channels, data)
+                            write_monitor_audio(monitor_stream, monitor_channels, data, bd)
                         except Exception as exc:
                             st.error_msg = f'Monitor error: {exc}'
                             try:
