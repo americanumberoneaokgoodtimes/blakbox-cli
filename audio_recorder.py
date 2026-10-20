@@ -6,7 +6,7 @@ Streams recorded audio to rotating files (WAV, MP3, FLAC, OGG).
 Live HUD: progress bars, disk space, microphone level graph, gain control.
 """
 
-VERSION = '1.2.0'
+VERSION = '1.3.0'
 
 import argparse
 import atexit

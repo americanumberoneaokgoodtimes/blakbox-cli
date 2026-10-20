@@ -48,7 +48,7 @@ python audio_recorder.py --output-dir D:\recordings
 |------|---------|-------------|
 | `-o` | `{datetime}` | Output filename base |
 | `-f` | `wav` | Format: wav, mp3, flac, ogg |
-| `-s` | `4000000000` | Max file size per file (bytes) |
+| `-s` | `4000000000` | Max file size per file (bytes or units: e.g. 4GB, 500MB) |
 | `-m` | `4` | Max files to keep |
 | `-b` | `320` | Bit rate (kbps, compressed formats) |
 | `-d` | `16` | Bit depth: 8, 16, 24, 32 |
@@ -57,17 +57,18 @@ python audio_recorder.py --output-dir D:\recordings
 | `-l` | `999999` | Max duration (seconds, 0=unlimited) |
 | `--output-dir` | `.` | Output directory |
 | `--device` | system default | Audio input device name or index |
+| `--monitor-device` | system default | Audio output device name or index for monitoring |
 | `--list-devices` | — | List input devices and exit |
 
 ## Interactive HUD
 
 Live display during recording:
 - **Size progress bar** — current file size vs limit
-- **Disk space bar** — disk used / total (color-coded: blue → yellow → red as disk fills)
+- **Disk space bar** — disk used / total (color-coded: blue → yellow → red as disk fills; emergency halt if < 50MB free)
 - **Microphone level meter** — real-time RMS + waveform sparkline
 - **Peak level** — peak indicator with color-coded zones
-- **Gain control** — dB and linear multiplier, auto-gain toggle
-- **Clipping counter** — clips detected in current file (resets on each new file)
+- **Gain control** — dB and linear multiplier, auto-gain toggle (with fast attack limiter)
+- **Clipping & drop counters** — true saturation clips (`Clip`) and hardware buffer drops (`Drop: X`)
 - **Timer** — total session elapsed time
 - **Error line** — ffmpeg or device errors shown in red if they occur
 
