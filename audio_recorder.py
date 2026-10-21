@@ -863,7 +863,8 @@ def write_monitor_audio(monitor_stream, monitor_channels, data, bit_depth=16):
         if monitor_channels == 2 and mdata.shape[1] == 1:
             mdata = np.repeat(mdata, 2, axis=1)
         elif monitor_channels == 1 and mdata.shape[1] > 1:
-            mdata = mdata[:, :1]
+            # Average channels cleanly rather than dropping right channel
+            mdata = np.rint(np.mean(mdata.astype(np.float64), axis=1, keepdims=True)).astype(mdata.dtype)
         else:
             mdata = mdata
     monitor_stream.write(mdata)
@@ -1182,20 +1183,33 @@ def pack_int24(data):
     return out.tobytes()
 
 
+def pack_pcm_bytes(data, bd, unsigned_8bit=False):
+    """Serialize audio array into explicit little-endian PCM byte string for given bit depth."""
+    if bd == 24:
+        return pack_int24(data)
+    elif bd == 8:
+        if unsigned_8bit:
+            return np.clip(data.astype(np.int16) + 128, 0, 255).astype(np.uint8).tobytes()
+        return np.asarray(data, dtype=np.int8).tobytes()
+    elif bd == 16:
+        return np.asarray(data, dtype='<i2').tobytes()
+    elif bd == 32:
+        return np.asarray(data, dtype='<i4').tobytes()
+    return data.tobytes()
+
+
 def write_wav_frames(wf, data, bd):
     """Write audio frames to an open wave.Wave_write, handling 8-bit and 24-bit correctly."""
-    if bd == 24:
-        wf.writeframes(pack_int24(data))
-    elif bd == 8:
-        # Standard WAV 8-bit PCM is unsigned uint8 (0-255, 128 = silence)
-        u8_data = np.clip(data.astype(np.int16) + 128, 0, 255).astype(np.uint8)
-        wf.writeframes(u8_data.tobytes())
-    else:
-        wf.writeframes(data.tobytes())
+    wf.writeframes(pack_pcm_bytes(data, bd, unsigned_8bit=True))
 
 
-def apply_gain(data, gain, bit_depth=None):
-    if gain == 1.0:
+def apply_gain(data, gain, bit_depth=None, prev_gain=None):
+    """Apply gain with round-to-nearest-even quantization and optional smooth envelope ramping."""
+    if prev_gain is None:
+        prev_gain = gain
+    if gain == 1.0 and prev_gain == 1.0:
+        return data
+    if len(data) == 0:
         return data
     if bit_depth is not None and bit_depth in (8, 16, 24, 32):
         mn = -(2 ** (bit_depth - 1))
@@ -1203,8 +1217,18 @@ def apply_gain(data, gain, bit_depth=None):
     else:
         mn = np.iinfo(data.dtype).min
         mx = np.iinfo(data.dtype).max
-    d = np.nan_to_num(data.astype(np.float64) * gain, nan=0.0)
-    return np.clip(d, mn, mx).astype(data.dtype)
+    f = data.astype(np.float64)
+    if prev_gain != gain:
+        # Smooth linear gain ramp over initial ~21ms (up to 1024 frames) to prevent boundary clicks
+        ramp_len = min(len(f), 1024)
+        envelope = np.full(len(f), gain, dtype=np.float64)
+        envelope[:ramp_len] = np.linspace(prev_gain, gain, ramp_len, endpoint=True)
+        if f.ndim > 1:
+            envelope = envelope[:, np.newaxis]
+        d = np.nan_to_num(f * envelope, nan=0.0)
+    else:
+        d = np.nan_to_num(f * gain, nan=0.0)
+    return np.clip(np.rint(d), mn, mx).astype(data.dtype)
 
 
 def rms_db(data, bit_depth):
@@ -1235,13 +1259,22 @@ def get_ffmpeg_fmt(bd):
 def build_ffmpeg_cmd(fmt, out_path, br, sr, ch, bd):
     """Build the ffmpeg command list for streaming encode from stdin."""
     infmt = get_ffmpeg_fmt(bd)
-    base = ['ffmpeg', '-y', '-f', infmt, '-ar', str(sr), '-ac', str(ch), '-i', '-']
+    base = ['ffmpeg', '-y', '-loglevel', 'error', '-f', infmt, '-ar', str(sr), '-ac', str(ch), '-i', '-']
     if fmt == 'mp3':
-        return base + ['-c:a', 'libmp3lame', '-b:a', f'{br}k', out_path]
+        eff_br = max(32, min(320, int(br)))
+        return base + ['-c:a', 'libmp3lame', '-b:a', f'{eff_br}k', '-compression_level', '2', out_path]
     elif fmt == 'flac':
-        return base + ['-c:a', 'flac', '-compression_level', '5', out_path]
+        flac_opts = ['-c:a', 'flac', '-compression_level', '5']
+        if bd == 32:
+            flac_opts += ['-strict', '-2']
+        return base + flac_opts + [out_path]
     elif fmt == 'ogg':
-        return base + ['-c:a', 'libvorbis', '-b:a', f'{br}k', out_path]
+        # Clamp bitrate to libvorbis supported range for channel count and sample rate
+        max_br = 240 if ch == 1 else 320
+        if sr <= 24000:
+            max_br = 64 if ch == 1 else 160
+        eff_br = max(48, min(max_br, int(br)))
+        return base + ['-c:a', 'libvorbis', '-b:a', f'{eff_br}k', out_path]
     raise ValueError(f'Unsupported format: {fmt}')
 
 
@@ -1543,9 +1576,12 @@ def test_audio_device(args):
             except (ValueError, TypeError):
                 pass
 
-        if dev is not None:
-            try:
-                dev_info = sd.query_devices(dev, 'input')
+        try:
+            dev_info = sd.query_devices(dev, 'input')
+            if isinstance(dev_info, dict):
+                max_in = int(dev_info.get('max_input_channels', args.channels))
+                if max_in > 0 and args.channels > max_in:
+                    args.channels = max_in
                 default_sr = int(dev_info.get('default_samplerate', args.sample_rate))
                 try:
                     sd.check_input_settings(device=dev, channels=args.channels, samplerate=args.sample_rate)
@@ -1556,8 +1592,8 @@ def test_audio_device(args):
                         bs = int(args.sample_rate * CHUNK_DURATION)
                     except Exception:
                         pass
-            except Exception:
-                pass
+        except Exception:
+            pass
 
         with AudioInputStream(samplerate=args.sample_rate, channels=args.channels,
                               dtype=dt, blocksize=bs, device=args.device,
@@ -1682,7 +1718,7 @@ class CompressedSink(AudioSink):
 
     def write(self, data, bd):
         if self.proc and self.proc.poll() is None:
-            raw = pack_int24(data) if bd == 24 else data.tobytes()
+            raw = pack_pcm_bytes(data, bd, unsigned_8bit=False)
             self.proc.stdin.write(raw)
             self.proc.stdin.flush()
             return len(raw)
@@ -1755,6 +1791,7 @@ def record_engine(args, sink):
             stream.start()
             monitor_stream = None
             monitor_channels = ch
+            prev_gain = st.gain
 
             try:
                 while st.running:
@@ -1814,7 +1851,7 @@ def record_engine(args, sink):
                         st.drops += 1
 
                     # Ensure 24-bit audio in int32 container is properly scaled if mock/direct stream was used
-                    if bd == 24 and data.dtype == np.int32 and (np.max(np.abs(data)) > 8388607):
+                    if bd == 24 and data.dtype == np.int32 and len(data) > 0 and (np.min(data) < -8388608 or np.max(data) > 8388607):
                         data = (data >> 8).astype(np.int32)
 
                     # Determine input level for Auto Gain
@@ -1840,8 +1877,10 @@ def record_engine(args, sink):
                             new_gain_db = min(30.0, cur_gain_db + release_step)
                             st.gain = 10.0 ** (new_gain_db / 20.0)
 
-                    # Apply gain to recorded audio
-                    data = apply_gain(data, st.gain, bd)
+                    # Apply gain to recorded audio with smooth envelope transition
+                    applied_gain = st.gain
+                    data = apply_gain(data, applied_gain, bd, prev_gain=prev_gain)
+                    prev_gain = applied_gain
 
                     # Measure output metrics on actual recorded audio
                     mx_val = (2 ** (bd - 1)) - 1

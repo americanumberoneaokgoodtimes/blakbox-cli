@@ -1175,6 +1175,68 @@ class TestAutoGainTargetAdjustment(unittest.TestCase):
         self.assertTrue(-42.0 <= current_out_db <= -38.0)
 
 
+
+class TestPristineAudioQualityFidelity(unittest.TestCase):
+    def test_apply_gain_rounds_instead_of_truncating(self):
+        # 3 * 0.6 = 1.8 -> rounds to 2 (not truncated to 1)
+        # -3 * 0.6 = -1.8 -> rounds to -2 (not truncated to -1)
+        data = np.array([3, -3], dtype=np.int16)
+        res = ar.apply_gain(data, 0.6, bit_depth=16)
+        self.assertEqual(res[0], 2)
+        self.assertEqual(res[1], -2)
+
+    def test_apply_gain_smooth_ramp_eliminates_discontinuity(self):
+        # Constant DC signal of 1000 with gain ramping from 1.0 to 2.0
+        data = np.full((2048, 2), 1000, dtype=np.int16)
+        res = ar.apply_gain(data, 2.0, bit_depth=16, prev_gain=1.0)
+        # First sample starts at prev_gain (1.0 -> 1000)
+        self.assertEqual(res[0, 0], 1000)
+        # Mid-ramp sample (~512) is near 1500
+        self.assertAlmostEqual(res[512, 0], 1500, delta=5)
+        # Post-ramp samples (1024+) are at target gain (2.0 -> 2000)
+        self.assertEqual(res[1023, 0], 2000)
+        self.assertEqual(res[2047, 0], 2000)
+
+    def test_ogg_mono_bitrate_clamping(self):
+        # libvorbis mono (ch=1) max bitrate at 48kHz is 240k; requesting 320k must clamp to 240k
+        cmd_mono = ar.build_ffmpeg_cmd('ogg', 'out.ogg', 320, 48000, 1, 16)
+        self.assertIn('240k', cmd_mono)
+        # Stereo (ch=2) at 48kHz allows 320k
+        cmd_stereo = ar.build_ffmpeg_cmd('ogg', 'out.ogg', 320, 48000, 2, 16)
+        self.assertIn('320k', cmd_stereo)
+
+    def test_flac_32bit_includes_strict_experimental(self):
+        cmd_32 = ar.build_ffmpeg_cmd('flac', 'out.flac', 320, 48000, 2, 32)
+        self.assertIn('-strict', cmd_32)
+        self.assertIn('-2', cmd_32)
+
+    def test_mp3_uses_high_quality_compression_level(self):
+        cmd = ar.build_ffmpeg_cmd('mp3', 'out.mp3', 320, 48000, 2, 16)
+        self.assertIn('-loglevel', cmd)
+        self.assertIn('error', cmd)
+        self.assertIn('-compression_level', cmd)
+        self.assertIn('2', cmd)
+
+    def test_monitor_stereo_to_mono_averages_channels(self):
+        class MockStream:
+            def __init__(self):
+                self.written = []
+            def write(self, d):
+                self.written.append(d)
+        ms = MockStream()
+        # Left = 100, Right = 300 -> Mono average should be 200 (not 100)
+        stereo_data = np.array([[100, 300], [200, 400]], dtype=np.int16)
+        ar.write_monitor_audio(ms, 1, stereo_data, bit_depth=16)
+        np.testing.assert_array_equal(ms.written[0], np.array([[200], [300]], dtype=np.int16))
+
+    def test_pack_pcm_bytes_all_bit_depths(self):
+        for bd, expected_bps in [(8, 1), (16, 2), (24, 3), (32, 4)]:
+            dt = ar.get_audio_dtype(bd)
+            arr = np.zeros((10, 2), dtype=dt)
+            raw = ar.pack_pcm_bytes(arr, bd)
+            self.assertEqual(len(raw), 20 * expected_bps)
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
 
