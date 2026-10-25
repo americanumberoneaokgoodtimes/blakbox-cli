@@ -6,10 +6,11 @@ Streams recorded audio to rotating files (WAV, MP3, FLAC, OGG).
 Live HUD: progress bars, disk space, microphone level graph, gain control.
 """
 
-VERSION = '1.3.0'
+VERSION = '1.4.0'
 
 import argparse
 import atexit
+import errno
 import glob
 import os
 import queue
@@ -19,6 +20,7 @@ import time
 import wave
 import subprocess
 import shutil
+import tempfile
 from datetime import datetime
 
 import numpy as np
@@ -36,6 +38,12 @@ try:
     HAS_TERMIOS = True
 except ImportError:
     HAS_TERMIOS = False
+
+try:
+    import select as _select_mod
+    HAS_SELECT = True
+except ImportError:
+    HAS_SELECT = False
 
 try:
     import tomllib
@@ -87,7 +95,7 @@ def _signal_handler(sig, frame):
 def register_cleanup_and_signals():
     """Register exit handlers and termination signals to guarantee terminal restoration."""
     atexit.register(restore_terminal)
-    for sig_name in ('SIGTERM', 'SIGHUP'):
+    for sig_name in ('SIGTERM', 'SIGHUP', 'SIGBREAK'):
         sig = getattr(signal, sig_name, None)
         if sig is not None:
             try:
@@ -122,6 +130,17 @@ DEFAULT_CHANNELS = 2
 DEFAULT_LENGTH = 999999
 CHUNK_DURATION = 0.5
 WAV_HEADER_BYTES = 44
+# The RIFF/WAVE container stores sizes as 32-bit values; leave headroom for one chunk.
+WAV_MAX_FILE_BYTES = 4_294_967_295 - 64 * 1024 * 1024
+# Bounded input queue (chunks). ~2 minutes of audio; beyond that chunks are dropped and counted.
+MAX_INPUT_QUEUE_CHUNKS = 240
+# libmp3lame only supports these sample rates.
+MP3_SAMPLE_RATES = (8000, 11025, 12000, 16000, 22050, 24000, 32000, 44100, 48000)
+# Sink failure circuit-breaker: this many failures inside the window halts recording.
+SINK_FAILURE_LIMIT = 3
+SINK_FAILURE_WINDOW_S = 60.0
+ERROR_DISPLAY_SECONDS = 5.0
+FFMPEG_FINALIZE_TIMEOUT_S = 30
 
 ANSI = {
     'reset': '\033[0m',
@@ -145,6 +164,37 @@ ANSI = {
 
 
 CONFIG_PATH = os.path.expanduser('~/.blakboxrc')
+
+_INVALID_NAME_CHARS = set('<>:"/\\|?*')
+
+
+def validate_base_name(name):
+    """Validate a recording base name. Returns (ok, message).
+
+    Rejects empty names, path separators, characters illegal on Windows, control
+    characters and names that would escape the output directory.
+    """
+    if name is None or not str(name).strip():
+        return False, 'name is empty'
+    name = str(name)
+    if name in ('.', '..') or name.endswith(('.', ' ')):
+        return False, 'name must not be "." / ".." or end with a dot or space'
+    bad = sorted({c for c in name if c in _INVALID_NAME_CHARS or ord(c) < 32})
+    if bad:
+        shown = ' '.join(repr(c) for c in bad)
+        return False, f'illegal character(s): {shown}'
+    return True, None
+
+
+def _hostapi_tag(dev):
+    """Return ' [Host API]' for a device dict, or '' if unavailable."""
+    try:
+        idx = dev.get('hostapi')
+        if idx is None:
+            return ''
+        return f' [{sd.query_hostapis(idx)["name"]}]'
+    except Exception:
+        return ''
 
 
 def load_config():
@@ -379,7 +429,7 @@ def parse_args():
             if dev['max_input_channels'] > 0:
                 marker = f'{ANSI["green"]}*{ANSI["reset"]}' if i == def_in else ' '
                 print(f'  {marker} [{i}] {dev["name"]}'
-                      f' ({dev["max_input_channels"]} ch, {int(dev["default_samplerate"])} Hz)')
+                      f' ({dev["max_input_channels"]} ch, {int(dev["default_samplerate"])} Hz){_hostapi_tag(dev)}')
         sys.exit(0)
 
     if args.device is None:
@@ -433,11 +483,21 @@ def parse_args():
             args.output = args.output[:-(len(fmt) + 1)]
             break
 
-    out_dir = os.path.abspath(args.output_dir)
+    ok, msg = validate_base_name(args.output)
+    if not ok:
+        print(f'Error: invalid output name "{args.output}": {msg}', file=sys.stderr)
+        sys.exit(2)
+
+    out_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     if not os.path.isdir(out_dir):
         print(f'Error: output directory does not exist: {out_dir}', file=sys.stderr)
         sys.exit(1)
     args.output_dir = out_dir
+
+    if args.file_format == 'wav' and args.size > WAV_MAX_FILE_BYTES:
+        print(f'{ANSI["yellow"]}Warning: WAV files are limited to 4 GiB; size limit reduced to '
+              f'{WAV_MAX_FILE_BYTES} bytes{ANSI["reset"]}', file=sys.stderr)
+        args.size = WAV_MAX_FILE_BYTES
 
     return args
 
@@ -475,6 +535,13 @@ def _readline_echo(prompt):
         chars = []
         while True:
             ch = msvcrt.getwch()
+            if ch in ('\x00', '\xe0'):
+                msvcrt.getwch()  # swallow the scan-code half of arrow/function keys
+                continue
+            if ch in ('\x03', '\x1b'):  # Ctrl+C / Esc cancel the prompt
+                sys.stdout.write('\n')
+                sys.stdout.flush()
+                return ''
             if ch in ('\r', '\n'):
                 sys.stdout.write('\n')
                 sys.stdout.flush()
@@ -602,7 +669,7 @@ def prompt_select_device(current_device=None):
         for idx, dev in input_devices[start_i:end_i]:
             marker = f'{ANSI["green"]}*{ANSI["reset"]}' if idx == curr_idx else ' '
             print(f'  {marker} [{idx}] {dev["name"]}'
-                  f' ({dev["max_input_channels"]} ch, {int(dev["default_samplerate"])} Hz)')
+                  f' ({dev["max_input_channels"]} ch, {int(dev["default_samplerate"])} Hz){_hostapi_tag(dev)}')
         print()
         prompt_txt = f'  Select device number [Enter to cancel]: {ANSI["cyan"]}'
         if total_pages > 1:
@@ -724,7 +791,7 @@ def prompt_select_output_device(current_output_device=None):
         for idx, dev in output_devices[start_i:end_i]:
             marker = f'{ANSI["green"]}*{ANSI["reset"]}' if idx == curr_idx else ' '
             print(f'  {marker} [{idx}] {dev["name"]}'
-                  f' ({dev["max_output_channels"]} ch, {int(dev["default_samplerate"])} Hz)')
+                  f' ({dev["max_output_channels"]} ch, {int(dev["default_samplerate"])} Hz){_hostapi_tag(dev)}')
         print()
         prompt_txt = f'  Select output device number [Enter for default, "c" to cancel]: {ANSI["cyan"]}'
         if total_pages > 1:
@@ -867,6 +934,8 @@ def write_monitor_audio(monitor_stream, monitor_channels, data, bit_depth=16):
             mdata = np.rint(np.mean(mdata.astype(np.float64), axis=1, keepdims=True)).astype(mdata.dtype)
         else:
             mdata = mdata
+    if mdata.ndim == 2 and mdata.shape[1] > monitor_channels:
+        mdata = mdata[:, :monitor_channels]
     monitor_stream.write(mdata)
 
 
@@ -887,7 +956,7 @@ class AudioInputStream:
             except (ValueError, TypeError):
                 pass
         self.device = device
-        self._queue = queue.Queue()
+        self._queue = queue.Queue(maxsize=MAX_INPUT_QUEUE_CHUNKS)
         self._overflow = False
         self._paused = False
         self._drops = 0
@@ -900,7 +969,12 @@ class AudioInputStream:
                 chunk = indata.copy()
                 if self.bit_depth == 24 and chunk.dtype == np.int32:
                     chunk = (chunk >> 8).astype(np.int32)
-                self._queue.put(chunk)
+                try:
+                    self._queue.put_nowait(chunk)
+                except queue.Full:
+                    # Consumer stalled: drop (and report) rather than grow without bound.
+                    self._overflow = True
+                    self._drops += 1
 
         self._stream = sd.InputStream(
             samplerate=samplerate,
@@ -944,6 +1018,23 @@ class AudioInputStream:
         self.stop()
         self.close()
 
+    def drain(self):
+        """Remove and return every chunk currently queued (call after stop())."""
+        chunks = []
+        while True:
+            try:
+                chunks.append(self._queue.get_nowait())
+            except queue.Empty:
+                return chunks
+
+    def wait_for_data(self, timeout=3.0):
+        """Block until one chunk arrives (and discard it). False if none arrived."""
+        try:
+            self._queue.get(timeout=timeout)
+            return True
+        except queue.Empty:
+            return False
+
     def read(self, blocksize):
         try:
             data = self._queue.get(timeout=2.0)
@@ -955,10 +1046,16 @@ class AudioInputStream:
             return np.zeros((blocksize, self.channels), dtype=self.dtype), True
 
 
-def handle_device_switch(st, args, current_stream, sr, ch, dt, bs):
+def handle_device_switch(st, args, current_stream, sr, ch, dt, bs, before_switch=None):
     """Handle device selection prompt and stream restart if requested.
     Always triggers a New File upon successful device switch to cleanly handle
     mismatched sample rates, channel layouts, and stream continuity.
+
+    If `before_switch(old_stream)` is given it is called once the target device
+    is validated, after the old stream has been stopped but before it is closed.
+    The recorder uses it to flush the audio still queued from the old device into
+    the current file and finalize that file (container footer / ffmpeg trailer),
+    exactly like [N]ew. A new file is then always started, whatever the outcome.
     """
     if not st.select_device:
         return current_stream
@@ -1009,6 +1106,14 @@ def handle_device_switch(st, args, current_stream, sr, ch, dt, bs):
     if current_stream is not None:
         try:
             current_stream.stop()
+        except Exception:
+            pass
+        if before_switch is not None:
+            try:
+                before_switch(current_stream)
+            except Exception as exc:
+                st.error_msg = f'Could not finalize file before switch: {exc}'
+        try:
             current_stream.close()
         except Exception:
             pass
@@ -1027,6 +1132,8 @@ def handle_device_switch(st, args, current_stream, sr, ch, dt, bs):
         return new_stream
     except Exception as exc:
         st.error_msg = f'Failed to switch device: {exc}'
+        if before_switch is not None:
+            st.new_file = True  # the previous file was already finalized
         try:
             restored_stream = AudioInputStream(samplerate=sr, channels=ch, dtype=dt,
                                                 blocksize=bs, device=args.device, bit_depth=args.bit_depth)
@@ -1135,14 +1242,30 @@ def _parse_index(path, base, fmt):
     prefix = f'{base}_'
     if not name.startswith(prefix):
         return None
-    try:
-        return int(name[len(prefix):])
-    except ValueError:
+    suffix = name[len(prefix):]
+    if not suffix.isdigit():
         return None
+    return int(suffix)
+
+
+def _indexed_files(base, fmt, out_dir):
+    """Return [(index, path)] of files named exactly '{base}_{NNNN}.{fmt}', sorted by index.
+
+    The glob pattern is escaped, and files whose suffix is not a pure number
+    (e.g. 'rec_backup.wav' when base is 'rec') are never returned.
+    """
+    pattern = os.path.join(glob.escape(out_dir), f'{glob.escape(base)}_*.{glob.escape(fmt)}')
+    found = []
+    for f in glob.glob(pattern):
+        idx = _parse_index(f, base, fmt)
+        if idx is not None:
+            found.append((idx, f))
+    found.sort()
+    return found
 
 
 def cleanup_oldest(base, fmt, out_dir, max_r):
-    files = sorted(glob.glob(os.path.join(out_dir, f'{base}_*.{fmt}')))
+    files = [f for _, f in _indexed_files(base, fmt, out_dir)]
     while len(files) >= max_r:
         try:
             os.remove(files[0])
@@ -1157,12 +1280,8 @@ def next_filename(base, fmt, out_dir):
     Finds the highest existing index and adds 1, so rotation after cleanup
     never collides with a file that was just kept (fixes BUG-01 data-loss).
     """
-    existing = glob.glob(os.path.join(out_dir, f'{base}_*.{fmt}'))
-    max_idx = 0
-    for f in existing:
-        idx = _parse_index(f, base, fmt)
-        if idx is not None and idx > max_idx:
-            max_idx = idx
+    existing = _indexed_files(base, fmt, out_dir)
+    max_idx = existing[-1][0] if existing else 0
     return os.path.join(out_dir, f'{base}_{max_idx + 1:04d}.{fmt}')
 
 
@@ -1262,7 +1381,12 @@ def build_ffmpeg_cmd(fmt, out_path, br, sr, ch, bd):
     base = ['ffmpeg', '-y', '-loglevel', 'error', '-f', infmt, '-ar', str(sr), '-ac', str(ch), '-i', '-']
     if fmt == 'mp3':
         eff_br = max(32, min(320, int(br)))
-        return base + ['-c:a', 'libmp3lame', '-b:a', f'{eff_br}k', '-compression_level', '2', out_path]
+        extra = []
+        if sr not in MP3_SAMPLE_RATES:
+            extra += ['-ar', str(min(MP3_SAMPLE_RATES, key=lambda r: abs(r - sr)))]
+        if ch > 2:
+            extra += ['-ac', '2']
+        return base + ['-c:a', 'libmp3lame', '-b:a', f'{eff_br}k', '-compression_level', '2'] + extra + [out_path]
     elif fmt == 'flac':
         flac_opts = ['-c:a', 'flac', '-compression_level', '5']
         if bd == 32:
@@ -1271,9 +1395,15 @@ def build_ffmpeg_cmd(fmt, out_path, br, sr, ch, bd):
     elif fmt == 'ogg':
         # Clamp bitrate to libvorbis supported range for channel count and sample rate
         max_br = 240 if ch == 1 else 320
-        if sr <= 24000:
+        min_br = 32
+        if sr <= 8000:
+            max_br = 32
+        elif sr <= 24000:
             max_br = 64 if ch == 1 else 160
-        eff_br = max(48, min(max_br, int(br)))
+            min_br = 48
+        else:
+            min_br = 48
+        eff_br = max(min_br, min(max_br, int(br)))
         return base + ['-c:a', 'libvorbis', '-b:a', f'{eff_br}k', out_path]
     raise ValueError(f'Unsupported format: {fmt}')
 
@@ -1301,7 +1431,10 @@ class UIState:
         self.drops = 0
         self.blank = False
         self.paused = False       # pause/resume state
+        self._error_msg = None
+        self._error_time = 0.0
         self.error_msg = None     # transient error string shown in HUD
+        self.fatal_msg = None     # reason recording was halted (shown in session summary)
         self.files_created = []   # all output paths opened this session
         self._drawn = False
         self._last_disk_info = None
@@ -1309,75 +1442,77 @@ class UIState:
         self._cached_dev = -999
         self._cached_dev_str = 'Default'
 
+    @property
+    def error_msg(self):
+        return self._error_msg
+
+    @error_msg.setter
+    def error_msg(self, value):
+        self._error_msg = value
+        self._error_time = time.time()
+
+    def expire_error(self):
+        """Clear a transient error once it has been visible long enough."""
+        if self._error_msg and time.time() - self._error_time > ERROR_DISPLAY_SECONDS:
+            self._error_msg = None
+
     def gain_db(self):
         return 20 * np.log10(self.gain) if self.gain > 0 else -100.0
 
+    def _handle_key(self, k):
+        """Apply a single key press (str, already decoded)."""
+        # Boss mode hides the UI, so ignore keys that would open a visible prompt.
+        if self.blank and k in ('r', 'R', 'd', 'D', 'm', 'M'):
+            return
+        if k in ('q', 'Q'):
+            self.running = False
+        elif k in ('n', 'N'):
+            self.new_file = True
+        elif k in ('+', '='):
+            new_db = min(30.0, round(self.gain_db(), 1) + 1.0)
+            self.gain = 10.0 ** (new_db / 20.0)
+        elif k in ('-', '_'):
+            new_db = max(-30.0, round(self.gain_db(), 1) - 1.0)
+            self.gain = 10.0 ** (new_db / 20.0)
+        elif k == '0':
+            self.gain = 1.0          # reset to unity (0 dB)
+        elif k in ('a', 'A'):
+            self.auto_gain = (self.auto_gain + 1) % 3
+        elif k in ('r', 'R'):
+            self.rename = True
+        elif k in ('d', 'D'):
+            self.select_device = True
+        elif k in ('m', 'M'):
+            self.toggle_monitor = True
+        elif k in ('p', 'P'):
+            self.paused = not self.paused
+        elif k == 'B':
+            self.blank = True        # Shift+B -> boss mode
+        elif k == 'b':
+            self.blank = False       # b -> unblank
+            self._drawn = False
+
     def read_key(self):
+        """Drain all pending key presses without blocking."""
         if HAS_MSVCRT:
             while msvcrt.kbhit():
                 k = msvcrt.getch()
-                if k in (b'q', b'Q'):
-                    self.running = False
-                elif k in (b'n', b'N'):
-                    self.new_file = True
-                elif k in (b'+', b'='):
-                    cur_db = round(self.gain_db(), 1)
-                    new_db = min(30.0, cur_db + 1.0)
-                    self.gain = 10.0 ** (new_db / 20.0)
-                elif k in (b'-', b'_'):
-                    cur_db = round(self.gain_db(), 1)
-                    new_db = max(-30.0, cur_db - 1.0)
-                    self.gain = 10.0 ** (new_db / 20.0)
-                elif k == b'0':
-                    self.gain = 1.0          # reset to unity (0 dB)
-                elif k in (b'a', b'A'):
-                    self.auto_gain = (self.auto_gain + 1) % 3
-                elif k in (b'r', b'R'):
-                    self.rename = True
-                elif k in (b'd', b'D'):
-                    self.select_device = True
-                elif k in (b'm', b'M'):
-                    self.toggle_monitor = True
-                elif k in (b'p', b'P'):
-                    self.paused = not self.paused
-                elif k == b'B':
-                    self.blank = True        # Shift+B → boss mode
-                elif k == b'b':
-                    self.blank = False       # b → unblank
-                    self._drawn = False
+                if k in (b'\x00', b'\xe0'):
+                    # Arrow / function key: swallow the scan-code byte
+                    if msvcrt.kbhit():
+                        msvcrt.getch()
+                    continue
+                self._handle_key(k.decode('latin-1'))
         elif HAS_SELECT:
             try:
-                if _select_mod.select([sys.stdin], [], [], 0)[0]:
-                    k = sys.stdin.read(1)
-                    if k in ('q', 'Q'):
-                        self.running = False
-                    elif k in ('n', 'N'):
-                        self.new_file = True
-                    elif k in ('+', '='):
-                        cur_db = round(self.gain_db(), 1)
-                        new_db = min(30.0, cur_db + 1.0)
-                        self.gain = 10.0 ** (new_db / 20.0)
-                    elif k in ('-', '_'):
-                        cur_db = round(self.gain_db(), 1)
-                        new_db = max(-30.0, cur_db - 1.0)
-                        self.gain = 10.0 ** (new_db / 20.0)
-                    elif k == '0':
-                        self.gain = 1.0
-                    elif k in ('a', 'A'):
-                        self.auto_gain = (self.auto_gain + 1) % 3
-                    elif k in ('r', 'R'):
-                        self.rename = True
-                    elif k in ('d', 'D'):
-                        self.select_device = True
-                    elif k in ('m', 'M'):
-                        self.toggle_monitor = True
-                    elif k in ('p', 'P'):
-                        self.paused = not self.paused
-                    elif k == 'B':
-                        self.blank = True
-                    elif k == 'b':
-                        self.blank = False
-                        self._drawn = False
+                fd = sys.stdin.fileno()
+                # Read from the raw fd: select() ignores TextIOWrapper buffering.
+                while _select_mod.select([fd], [], [], 0)[0]:
+                    data = os.read(fd, 64)
+                    if not data:
+                        break
+                    for ch in data.decode('utf-8', errors='ignore'):
+                        self._handle_key(ch)
             except Exception:
                 pass
 
@@ -1397,6 +1532,7 @@ def draw_hud(S, args, cur_file, cur_size, size_lim, elapsed, total_override=None
     MIN_DISK_FREE_BYTES = 50 * 1024 * 1024
     if free < MIN_DISK_FREE_BYTES:
         S.error_msg = f'CRITICAL: Low disk space ({fmt_size(free)} free)! Halting recording.'
+        S.fatal_msg = S.error_msg
         S.running = False
 
     base = os.path.basename(cur_file)
@@ -1451,7 +1587,7 @@ def draw_hud(S, args, cur_file, cur_size, size_lim, elapsed, total_override=None
     lines = [
         f'{ANSI["cyan"]}{"=" * 54}{ANSI["reset"]}',
         f'{ANSI["cyan"]}|{ANSI["reset"]}  {ANSI["bold"]}{rec_color}*{ANSI["reset"]}'
-        f'  {ANSI["bold"]}{rec_label}{ANSI["reset"]}{" " * (33 - len(rec_label) + 9)}{ANSI["cyan"]}|{ANSI["reset"]}',
+        f'  {ANSI["bold"]}{rec_label}{ANSI["reset"]}{" " * (47 - len(rec_label))}{ANSI["cyan"]}|{ANSI["reset"]}',
         f'{ANSI["cyan"]}+{"=" * 52}+{ANSI["reset"]}',
         '',
         f'  {ANSI["white"]}Format{ANSI["reset"]}: {ANSI["yellow"]}{args.file_format.upper():5s}{ANSI["reset"]}'
@@ -1551,14 +1687,14 @@ def draw_startup(args):
             print(f'{ANSI["red"]}  Device test failed: {err}{ANSI["reset"]}')
             print(f'{ANSI["red"]}  Check device name/index with --list-devices{ANSI["reset"]}')
             sys.exit(1)
-    lines.append(f'  {ANSI["green"]}  Device OK{ANSI["reset"]}')
-    
-    lines += [
+    print('\n'.join([
+        f'  {ANSI["green"]}  Device OK{ANSI["reset"]}',
         '',
         f'{ANSI["cyan"]}{"-" * 54}{ANSI["reset"]}',
-    ]
-    print('\n'.join(lines))
+    ]))
     sys.stdout.flush()
+    if sys.stdout.isatty():
+        time.sleep(1.0)  # let the user read the configuration before the HUD takes over
 
 
 def test_audio_device(args):
@@ -1598,7 +1734,8 @@ def test_audio_device(args):
         with AudioInputStream(samplerate=args.sample_rate, channels=args.channels,
                               dtype=dt, blocksize=bs, device=args.device,
                               bit_depth=args.bit_depth) as stream:
-            stream.read(bs)
+            if not stream.wait_for_data(max(3.0, 4 * CHUNK_DURATION)):
+                return False, 'device opened but delivered no audio data'
         return True, None
     except Exception as e:
         return False, str(e)
@@ -1608,6 +1745,9 @@ def _print_session_summary(st):
     """Print end-of-session stats and file list."""
     print(f'{ANSI["show_cursor"]}', end='')
     print(f'\n{ANSI["green"]}Recording stopped.{ANSI["reset"]}')
+    fatal = getattr(st, 'fatal_msg', None)
+    if fatal:
+        print(f'{ANSI["red"]}Reason: {fatal}{ANSI["reset"]}')
     print(f'{ANSI["dim"]}Total: {fmt_size(st.total_bytes)}{ANSI["reset"]}')
     if st.files_created:
         print(f'{ANSI["white"]}Files created:{ANSI["reset"]}')
@@ -1647,28 +1787,43 @@ class AudioSink:
 
 
 class WavSink(AudioSink):
-    """Audio sink for writing uncompressed WAV audio files."""
+    """Audio sink for writing uncompressed WAV audio files.
+
+    The file handle is owned here (not by `wave`) so it can be flushed after every
+    chunk; the WAV header is re-patched by `wave` on each write, so a crash loses
+    at most the chunk in flight.
+    """
     fmt = 'wav'
 
     def __init__(self):
         self.wf = None
+        self._fh = None
         self.cur_file_size = WAV_HEADER_BYTES
         self.cur_path = None
 
     def open(self, path, sr, ch, bd, br=None):
         self.close()
         self.cur_path = path
-        self.wf = wave.open(path, 'wb')
-        self.wf.setnchannels(ch)
-        self.wf.setsampwidth(bd // 8)
-        self.wf.setframerate(sr)
+        self._fh = open(path, 'wb')
+        try:
+            self.wf = wave.open(self._fh, 'wb')
+            self.wf.setnchannels(ch)
+            self.wf.setsampwidth(bd // 8)
+            self.wf.setframerate(sr)
+        except Exception:
+            self.wf = None
+            self._fh.close()
+            self._fh = None
+            raise
         self.cur_file_size = WAV_HEADER_BYTES
 
     def write(self, data, bd):
         if self.wf is not None:
             write_wav_frames(self.wf, data, bd)
-            fb = data.size * 3 if bd == 24 else len(data.tobytes())
+            fb = data.size * 3 if bd == 24 else data.nbytes
             self.cur_file_size += fb
+            if self._fh is not None:
+                self._fh.flush()
             return fb
         return 0
 
@@ -1679,6 +1834,12 @@ class WavSink(AudioSink):
             except Exception:
                 pass
             self.wf = None
+        if self._fh is not None:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+            self._fh = None
 
     def get_current_size(self):
         return self.cur_file_size
@@ -1700,6 +1861,19 @@ class CompressedSink(AudioSink):
         self.sr = None
         self.ch = None
         self.bd = None
+        self._err = None
+        self.last_error = None
+
+    def _read_err(self):
+        """Return the tail of ffmpeg's stderr output (empty string if unavailable)."""
+        if self._err is None:
+            return ''
+        try:
+            self._err.flush()
+            self._err.seek(0)
+            return self._err.read().decode(errors='replace').strip()[-300:]
+        except Exception:
+            return ''
 
     def open(self, path, sr, ch, bd, br=None):
         self.close()
@@ -1710,11 +1884,18 @@ class CompressedSink(AudioSink):
         if br is not None:
             self.bit_rate = br
         cmd = build_ffmpeg_cmd(self.fmt, path, self.bit_rate, sr, ch, bd)
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.05)
+        # stderr goes to a temp file: nothing needs draining, and the text is
+        # available to report if ffmpeg dies.
+        self._err = tempfile.TemporaryFile()
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=self._err)
+        for _ in range(4):
+            time.sleep(0.05)
+            if self.proc.poll() is not None:
+                break
         if self.proc.poll() is not None:
-            err = self.proc.stderr.read().decode(errors='replace')
-            raise RuntimeError(f'ffmpeg failed to start: {err[:300]}')
+            err = self._read_err()
+            self.close()
+            raise RuntimeError(f'ffmpeg failed to start: {err}')
 
     def write(self, data, bd):
         if self.proc and self.proc.poll() is None:
@@ -1723,7 +1904,9 @@ class CompressedSink(AudioSink):
             self.proc.stdin.flush()
             return len(raw)
         else:
-            raise BrokenPipeError('ffmpeg process died unexpectedly')
+            detail = self._read_err()
+            raise BrokenPipeError(f'ffmpeg process died unexpectedly: {detail}' if detail
+                                  else 'ffmpeg process died unexpectedly')
 
     def close(self):
         if self.proc is None:
@@ -1732,20 +1915,36 @@ class CompressedSink(AudioSink):
             self.proc.stdin.close()
         except (BrokenPipeError, OSError):
             pass
+        self.last_error = None
         try:
-            self.proc.wait(timeout=10)
+            # Finalizing (flushing the encoder, writing the footer) can be slow on a
+            # loaded machine; killing early would truncate the file.
+            rc = self.proc.wait(timeout=FFMPEG_FINALIZE_TIMEOUT_S)
+            if isinstance(rc, int) and rc != 0:
+                self.last_error = f'ffmpeg exited with code {rc}: {self._read_err()}'
         except subprocess.TimeoutExpired:
             self.proc.kill()
             self.proc.wait()
+            self.last_error = 'ffmpeg did not finish in time and was killed; file may be truncated'
         self.proc = None
+        if self._err is not None:
+            try:
+                self._err.close()
+            except Exception:
+                pass
+            self._err = None
 
     def get_current_size(self):
         return _get_file_size(self.cur_path) if self.cur_path else 0
 
     def on_rotate(self, st):
+        if self.proc is None:
+            return  # already finalized; don't count this file twice
         actual = self.get_current_size()
         self.close()
         st.total_bytes += actual
+        if self.last_error:
+            st.error_msg = self.last_error
 
     def get_total_bytes(self, st, cur_size):
         return st.total_bytes + cur_size
@@ -1764,231 +1963,357 @@ def record_engine(args, sink):
     ch = args.channels
     md = args.length
     fmt = sink.fmt
-
-    cleanup_oldest(rotation_base, fmt, out_dir, max_r)
-    cur_file = next_filename(rotation_base, fmt, out_dir)
-    st.files_created.append(cur_file)
+    br = getattr(args, 'bit_rate', DEFAULT_BIT_RATE)
+    cur_file = None
     args._orig_channels = ch
 
     set_raw_terminal()
     try:
+        # Run the pre-flight device test BEFORE touching the output directory, so a
+        # failed start can never delete existing recordings.
         draw_startup(args)
         sr = args.sample_rate
         ch = args.channels
         print(ANSI['hide_cursor'], end='')
 
+        bs = int(sr * CHUNK_DURATION)
+        dt = get_audio_dtype(bd)
         t0 = time.time()
+        paused_total = 0.0
+        pause_started = None
         was_paused = False
+        chunks_in_file = 0
+        failure_times = []
+        stream = None
+        monitor_stream = None
+        monitor_channels = ch
+        monitor_params = None
+        prev_gain = st.gain
+
+        def elapsed():
+            """Session time excluding paused intervals."""
+            now = time.time()
+            in_pause = (now - pause_started) if pause_started is not None else 0.0
+            return now - t0 - paused_total - in_pause
+
+        def halt(msg):
+            st.fatal_msg = msg
+            st.error_msg = msg
+            st.running = False
+
+        def open_next_file(prune=True):
+            nonlocal cur_file, chunks_in_file
+            if prune:
+                cleanup_oldest(rotation_base, fmt, out_dir, max_r)
+            cur_file = next_filename(rotation_base, fmt, out_dir)
+            st.files_created.append(cur_file)
+            st.clipping = 0
+            st._drawn = False
+            chunks_in_file = 0
+            sink.open(cur_file, sr, ch, bd, br)
+
+        def rotate(apply_args=False):
+            """Close the current file and open the next. False (and halt) on failure."""
+            nonlocal sr, ch, bd, bs, dt
+            try:
+                sink.on_rotate(st)
+                if apply_args:
+                    ch = args.channels
+                    sr = args.sample_rate
+                    bd = args.bit_depth
+                    bs = int(sr * CHUNK_DURATION)
+                    dt = get_audio_dtype(bd)
+                open_next_file()
+                return True
+            except Exception as exc:
+                halt(f'Could not open new file: {exc}')
+                return False
+
+        def refresh_monitor():
+            """Reopen the monitor stream if the input format changed."""
+            nonlocal monitor_stream, monitor_channels, monitor_params
+            if monitor_stream is None or monitor_params == (sr, ch):
+                return
+            try:
+                monitor_stream.stop()
+                monitor_stream.close()
+            except Exception:
+                pass
+            try:
+                monitor_stream, monitor_channels = open_monitor_stream(
+                    sr, ch, dt, device=st.monitor_device)
+                monitor_params = (sr, ch)
+            except Exception as exc:
+                monitor_stream = None
+                st.monitor = False
+                monitor_params = None
+                st.error_msg = f'Monitor error: {exc}'
+
+        def write_chunk(data):
+            nonlocal chunks_in_file
+            fb = sink.write(data, bd)
+            if isinstance(sink, WavSink):
+                st.total_bytes += fb
+            chunks_in_file += 1
+
+        def recover_from_sink_failure(exc, data):
+            """Handle a failed write. Returns True if recording can continue."""
+            nonlocal chunks_in_file
+            if getattr(exc, 'errno', None) == errno.ENOSPC:
+                halt('Disk full - recording halted.')
+                return False
+            now = time.time()
+            failure_times[:] = [t for t in failure_times if now - t < SINK_FAILURE_WINDOW_S]
+            failure_times.append(now)
+            if len(failure_times) >= SINK_FAILURE_LIMIT:
+                halt(f'Output keeps failing, giving up: {exc}')
+                return False
+            st.error_msg = f'Output failed ({exc}); starting new file...'
+            wrote_data = chunks_in_file > 0
+            try:
+                sink.on_rotate(st)
+                if not wrote_data and cur_file and os.path.exists(cur_file) \
+                        and _get_file_size(cur_file) == 0:
+                    try:
+                        os.remove(cur_file)  # discard the empty failed file
+                    except OSError:
+                        pass
+                # Only prune old recordings if the failed file actually held audio;
+                # an immediately-failing sink must never push real files out.
+                open_next_file(prune=wrote_data)
+                write_chunk(data)  # re-send the chunk that failed
+            except Exception as exc2:
+                halt(f'Output restart failed: {exc2}')
+                return False
+            return True
+
+        def flush_old_stream(old_stream):
+            """Write what the old device still has queued into the current file.
+
+            The file itself is closed (footer/trailer written) by the regular
+            new-file rotation that follows, after the new stream is already
+            capturing, so slow ffmpeg finalization never costs audio.
+            """
+            nonlocal prev_gain
+            for chunk in old_stream.drain():
+                try:
+                    chunk = apply_gain(chunk, st.gain, bd, prev_gain=prev_gain)
+                    prev_gain = st.gain
+                    write_chunk(chunk)
+                except Exception:
+                    break
+
+        def do_rename():
+            nonlocal rotation_base
+            st.rename = False
+            new_base = prompt_rename(cur_file)
+            st._drawn = False
+            if not new_base:
+                return True
+            ok, msg = validate_base_name(new_base)
+            if not ok:
+                st.error_msg = f'Invalid name: {msg}'
+                return True
+            rotation_base = new_base
+            return rotate()
 
         try:
-            sink.open(cur_file, sr, ch, bd, getattr(args, 'bit_rate', DEFAULT_BIT_RATE))
-
-            bs = int(sr * CHUNK_DURATION)
-            dt = get_audio_dtype(bd)
-
-            stream = AudioInputStream(samplerate=sr, channels=ch, dtype=dt, blocksize=bs,
-                                      device=args.device, bit_depth=bd)
-            stream.start()
-            monitor_stream = None
-            monitor_channels = ch
-            prev_gain = st.gain
-
             try:
-                while st.running:
-                    el = time.time() - t0
-                    if md > 0 and el >= md:
-                        break
+                open_next_file()
+                stream = AudioInputStream(samplerate=sr, channels=ch, dtype=dt, blocksize=bs,
+                                          device=args.device, bit_depth=bd)
+                stream.start()
+            except Exception as exc:
+                halt(f'Could not start recording: {exc}')
 
-                    # Handle pause: read keys and update HUD, but don't process audio
-                    if st.paused:
-                        if not was_paused:
-                            stream.pause()
-                            was_paused = True
-                        st.read_key()
-                        stream = handle_device_switch(st, args, stream, sr, ch, dt, bs)
-                        monitor_stream, monitor_channels = handle_monitor_toggle(st, monitor_stream, args.sample_rate, args.channels, dt)
-                        if st.new_file:
-                            sink.on_rotate(st)
-                            cleanup_oldest(rotation_base, fmt, out_dir, max_r)
-                            cur_file = next_filename(rotation_base, fmt, out_dir)
-                            st.files_created.append(cur_file)
-                            ch = args.channels
-                            sr = args.sample_rate
-                            bd = args.bit_depth
-                            bs = int(sr * CHUNK_DURATION)
-                            dt = get_audio_dtype(bd)
-                            st.new_file = False
-                            st.clipping = 0
-                            st._drawn = False
-                            sink.open(cur_file, sr, ch, bd, getattr(args, 'bit_rate', DEFAULT_BIT_RATE))
-                        cur_actual = sink.get_current_size()
-                        draw_hud(st, args, cur_file, cur_actual, size_lim, el,
-                                 total_override=sink.get_total_bytes(st, cur_actual))
-                        time.sleep(0.1)
-                        continue
+            while st.running:
+                el = elapsed()
+                if md > 0 and el >= md:
+                    break
 
-                    if was_paused:
-                        stream.resume()
-                        was_paused = False
-
-                    # Automatic size-limit rotation
-                    cur_actual = sink.get_current_size()
-                    if cur_actual >= size_lim:
-                        sink.on_rotate(st)
-                        cleanup_oldest(rotation_base, fmt, out_dir, max_r)
-                        cur_file = next_filename(rotation_base, fmt, out_dir)
-                        st.files_created.append(cur_file)
-                        st.clipping = 0
-                        st._drawn = False
-                        sink.open(cur_file, sr, ch, bd, getattr(args, 'bit_rate', DEFAULT_BIT_RATE))
-                        st.read_key()
-                        draw_hud(st, args, cur_file, 0, size_lim, el,
-                                 total_override=sink.get_total_bytes(st, 0))
-                        continue
-
-                    data, ov = stream.read(bs)
-                    if ov:
-                        st.drops += 1
-
-                    # Ensure 24-bit audio in int32 container is properly scaled if mock/direct stream was used
-                    if bd == 24 and data.dtype == np.int32 and len(data) > 0 and (np.min(data) < -8388608 or np.max(data) > 8388607):
-                        data = (data >> 8).astype(np.int32)
-
-                    # Determine input level for Auto Gain
-                    raw_db = rms_db(data, bd)
-
-                    # Auto Gain control
-                    # Targets recorded Level near -38 to -42 dBFS (center: -40 dBFS)
-                    if st.auto_gain and raw_db > -65.0:
-                        cur_gain_db = st.gain_db()
-                        current_out_db = raw_db + cur_gain_db
-                        speed = 2.0 if st.auto_gain == 2 else 1.0
-
-                        # Too loud (> -38 dB): attack (reduce gain)
-                        if current_out_db > -38.0:
-                            excess = current_out_db - (-38.0)
-                            attack_step = min(6.0, max(0.5, excess * 0.35 * speed))
-                            new_gain_db = max(-30.0, cur_gain_db - attack_step)
-                            st.gain = 10.0 ** (new_gain_db / 20.0)
-                        # Too quiet (< -42 dB): release (increase gain)
-                        elif current_out_db < -42.0:
-                            deficit = (-42.0) - current_out_db
-                            release_step = min(2.5, max(0.2, deficit * 0.15 * speed))
-                            new_gain_db = min(30.0, cur_gain_db + release_step)
-                            st.gain = 10.0 ** (new_gain_db / 20.0)
-
-                    # Apply gain to recorded audio with smooth envelope transition
-                    applied_gain = st.gain
-                    data = apply_gain(data, applied_gain, bd, prev_gain=prev_gain)
-                    prev_gain = applied_gain
-
-                    # Measure output metrics on actual recorded audio
-                    mx_val = (2 ** (bd - 1)) - 1
-                    peak = np.max(np.abs(data)) if len(data) > 0 else 0
-                    st.peak_db = 20.0 * np.log10(peak / mx_val) if peak > 0 else -100.0
-                    clip_count = int(np.sum(np.abs(data) >= mx_val * 0.999))
-                    st.clipping += clip_count
-                    if clip_count > 0 and st.auto_gain:
-                        # Rapid limiter backoff on hard clip
-                        cur_gain_db = max(-30.0, st.gain_db() - 3.0)
-                        st.gain = 10.0 ** (cur_gain_db / 20.0)
-
-                    if st.monitor and monitor_stream is not None:
-                        try:
-                            write_monitor_audio(monitor_stream, monitor_channels, data, bd)
-                        except Exception as exc:
-                            st.error_msg = f'Monitor error: {exc}'
-                            try:
-                                monitor_stream.stop()
-                                monitor_stream.close()
-                            except Exception:
-                                pass
-                            monitor_stream = None
-                            st.monitor = False
-
-                    db = rms_db(data, bd)
-                    st.current_db = db
-                    st.levels.append(db)
-                    if len(st.levels) > 40:
-                        st.levels.pop(0)
-
-                    # Write audio chunk to sink with crash recovery
-                    try:
-                        fb = sink.write(data, bd)
-                        if isinstance(sink, WavSink):
-                            st.total_bytes += fb
-                        st.error_msg = None
-                    except (BrokenPipeError, OSError):
-                        st.error_msg = 'Sink process died — rotating to new file...'
-                        try:
-                            sink.on_rotate(st)
-                            cleanup_oldest(rotation_base, fmt, out_dir, max_r)
-                            cur_file = next_filename(rotation_base, fmt, out_dir)
-                            st.files_created.append(cur_file)
-                            st.clipping = 0
-                            st._drawn = False
-                            sink.open(cur_file, sr, ch, bd, getattr(args, 'bit_rate', DEFAULT_BIT_RATE))
-                            st.error_msg = None
-                        except Exception as exc:
-                            st.error_msg = f'Sink restart failed: {exc}'
-                            st.running = False
-                            break
-
+                # Handle pause: read keys and update HUD, but don't process audio
+                if st.paused:
+                    if not was_paused:
+                        stream.pause()
+                        was_paused = True
+                        pause_started = time.time()
                     st.read_key()
-                    stream = handle_device_switch(st, args, stream, sr, ch, dt, bs)
-                    monitor_stream, monitor_channels = handle_monitor_toggle(st, monitor_stream, args.sample_rate, args.channels, dt)
+                    old_stream = stream
+                    stream = handle_device_switch(st, args, stream, sr, ch, dt, bs,
+                                              before_switch=flush_old_stream)
+                    if stream is None:
+                        halt('Input device lost')
+                        break
+                    if stream is not old_stream:
+                        stream.pause()  # new device must not record while paused
+                    monitor_stream, monitor_channels = handle_monitor_toggle(
+                        st, monitor_stream, args.sample_rate, args.channels, dt)
+                    if monitor_stream is None:
+                        monitor_params = None
+                    elif monitor_params is None:
+                        monitor_params = (args.sample_rate, args.channels)
+                    if st.rename and not do_rename():
+                        break
+                    if st.new_file:
+                        st.new_file = False
+                        if not rotate(apply_args=True):
+                            break
+                        refresh_monitor()
                     cur_actual = sink.get_current_size()
                     draw_hud(st, args, cur_file, cur_actual, size_lim, el,
                              total_override=sink.get_total_bytes(st, cur_actual))
+                    time.sleep(0.1)
+                    continue
 
-                    # Manual new-file rotation (or device switch rotation)
-                    if st.new_file:
-                        sink.on_rotate(st)
-                        cleanup_oldest(rotation_base, fmt, out_dir, max_r)
-                        cur_file = next_filename(rotation_base, fmt, out_dir)
-                        st.files_created.append(cur_file)
-                        ch = args.channels
-                        sr = args.sample_rate
-                        bd = args.bit_depth
-                        bs = int(sr * CHUNK_DURATION)
-                        dt = get_audio_dtype(bd)
-                        st.new_file = False
-                        st.clipping = 0
-                        st._drawn = False
-                        sink.open(cur_file, sr, ch, bd, getattr(args, 'bit_rate', DEFAULT_BIT_RATE))
+                if was_paused:
+                    stream.resume()
+                    was_paused = False
+                    paused_total += time.time() - pause_started
+                    pause_started = None
 
-                    # Rename
-                    if st.rename:
-                        sink.on_rotate(st)
-                        new_base = prompt_rename(cur_file)
-                        if new_base:
-                            rotation_base = new_base
-                        cleanup_oldest(rotation_base, fmt, out_dir, max_r)
-                        cur_file = next_filename(rotation_base, fmt, out_dir)
-                        st.files_created.append(cur_file)
-                        st.rename = False
-                        st.clipping = 0
-                        st._drawn = False
-                        sink.open(cur_file, sr, ch, bd, getattr(args, 'bit_rate', DEFAULT_BIT_RATE))
-            finally:
-                if stream is not None:
+                # Automatic size-limit rotation
+                cur_actual = sink.get_current_size()
+                if cur_actual >= size_lim:
+                    if not rotate():
+                        break
+                    st.read_key()
+                    draw_hud(st, args, cur_file, 0, size_lim, el,
+                             total_override=sink.get_total_bytes(st, 0))
+                    continue
+
+                data, ov = stream.read(bs)
+                if ov:
+                    st.drops += 1
+
+                # Ensure 24-bit audio in int32 container is properly scaled if mock/direct stream was used
+                if bd == 24 and data.dtype == np.int32 and len(data) > 0 and (np.min(data) < -8388608 or np.max(data) > 8388607):
+                    data = (data >> 8).astype(np.int32)
+
+                # Determine input level for Auto Gain
+                raw_db = rms_db(data, bd)
+
+                # Auto Gain control
+                # Targets recorded Level near -38 to -42 dBFS (center: -40 dBFS)
+                if st.auto_gain and raw_db > -65.0:
+                    cur_gain_db = st.gain_db()
+                    current_out_db = raw_db + cur_gain_db
+                    speed = 2.0 if st.auto_gain == 2 else 1.0
+
+                    # Too loud (> -38 dB): attack (reduce gain)
+                    if current_out_db > -38.0:
+                        excess = current_out_db - (-38.0)
+                        attack_step = min(6.0, max(0.5, excess * 0.35 * speed))
+                        new_gain_db = max(-30.0, cur_gain_db - attack_step)
+                        st.gain = 10.0 ** (new_gain_db / 20.0)
+                    # Too quiet (< -42 dB): release (increase gain)
+                    elif current_out_db < -42.0:
+                        deficit = (-42.0) - current_out_db
+                        release_step = min(2.5, max(0.2, deficit * 0.15 * speed))
+                        new_gain_db = min(30.0, cur_gain_db + release_step)
+                        st.gain = 10.0 ** (new_gain_db / 20.0)
+
+                # Apply gain to recorded audio with smooth envelope transition
+                applied_gain = st.gain
+                data = apply_gain(data, applied_gain, bd, prev_gain=prev_gain)
+                prev_gain = applied_gain
+
+                # Measure output metrics on actual recorded audio.
+                # Widen to int64 first: np.abs(int16(-32768)) overflows back to -32768.
+                mx_val = (2 ** (bd - 1)) - 1
+                abs_data = (np.abs(data.astype(np.int64)) if len(data) > 0
+                            else np.zeros(1, dtype=np.int64))
+                peak = int(np.max(abs_data))
+                st.peak_db = 20.0 * np.log10(peak / mx_val) if peak > 0 else -100.0
+                clip_count = int(np.sum(abs_data >= mx_val * 0.999))
+                st.clipping += clip_count
+                if clip_count > 0 and st.auto_gain:
+                    # Rapid limiter backoff on hard clip
+                    cur_gain_db = max(-30.0, st.gain_db() - 3.0)
+                    st.gain = 10.0 ** (cur_gain_db / 20.0)
+
+                if st.monitor and monitor_stream is not None:
                     try:
-                        stream.stop()
-                        stream.close()
-                    except Exception:
-                        pass
-                if monitor_stream is not None:
-                    try:
-                        monitor_stream.stop()
-                        monitor_stream.close()
-                    except Exception:
-                        pass
+                        write_monitor_audio(monitor_stream, monitor_channels, data, bd)
+                    except Exception as exc:
+                        st.error_msg = f'Monitor error: {exc}'
+                        try:
+                            monitor_stream.stop()
+                            monitor_stream.close()
+                        except Exception:
+                            pass
+                        monitor_stream = None
+                        monitor_params = None
+                        st.monitor = False
 
+                db = rms_db(data, bd)
+                st.current_db = db
+                st.levels.append(db)
+                if len(st.levels) > 40:
+                    st.levels.pop(0)
+
+                # Write audio chunk to sink with crash recovery
+                try:
+                    write_chunk(data)
+                    st.expire_error()
+                except (BrokenPipeError, OSError) as exc:
+                    if not recover_from_sink_failure(exc, data):
+                        break
+
+                st.read_key()
+                stream = handle_device_switch(st, args, stream, sr, ch, dt, bs,
+                                              before_switch=flush_old_stream)
+                if stream is None:
+                    halt('Input device lost')
+                    break
+                monitor_stream, monitor_channels = handle_monitor_toggle(
+                    st, monitor_stream, args.sample_rate, args.channels, dt)
+                if monitor_stream is None:
+                    monitor_params = None
+                elif monitor_params is None:
+                    monitor_params = (args.sample_rate, args.channels)
+                cur_actual = sink.get_current_size()
+                draw_hud(st, args, cur_file, cur_actual, size_lim, el,
+                         total_override=sink.get_total_bytes(st, cur_actual))
+
+                # Manual new-file rotation (or device switch rotation)
+                if st.new_file:
+                    st.new_file = False
+                    if not rotate(apply_args=True):
+                        break
+                    refresh_monitor()
+
+                # Rename
+                if st.rename and not do_rename():
+                    break
         except KeyboardInterrupt:
             pass
         finally:
+            if stream is not None:
+                try:
+                    stream.stop()
+                except Exception:
+                    pass
+                if not was_paused and cur_file and not st.fatal_msg:
+                    # Audio captured but not yet written (e.g. after a long prompt)
+                    try:
+                        for chunk in stream.drain():
+                            chunk = apply_gain(chunk, st.gain, bd, prev_gain=prev_gain)
+                            prev_gain = st.gain
+                            write_chunk(chunk)
+                    except Exception:
+                        pass
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+            if monitor_stream is not None:
+                try:
+                    monitor_stream.stop()
+                    monitor_stream.close()
+                except Exception:
+                    pass
             sink.close()
-            if isinstance(sink, CompressedSink):
+            if isinstance(sink, CompressedSink) and cur_file:
                 st.total_bytes += _get_file_size(cur_file)
     finally:
         restore_terminal()

@@ -1,3 +1,5 @@
+> **Superseded.** This 2026-10-14 audit is historical (v1.2.x). FEAT-01 (config file) and FEAT-03 (pre-flight device test) have since been implemented, and several "fixed" items were later found incomplete (e.g. Unix key input). Current status: see README and the later audit remediation.
+
 # blakebox-v1.2 — Comprehensive Audit Report
 **Date:** 2026-10-14  
 **Auditor:** claude-sonnet-4-6  

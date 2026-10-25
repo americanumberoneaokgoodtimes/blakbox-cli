@@ -17,3 +17,5 @@ build/
 dist/
 *.spec
 *.exe
+# Agent session transcripts
+*-comprehensive-audit-*.txt

@@ -1242,3 +1242,330 @@ if __name__ == '__main__':
 
 
 
+
+
+class TestRemediationFixes(unittest.TestCase):
+    """Regression tests for the audit remediation."""
+
+    def setUp(self):
+        self.td = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.td, ignore_errors=True)
+
+    def _touch(self, name):
+        open(os.path.join(self.td, name), 'wb').close()
+
+    def test_cleanup_ignores_unrelated_and_non_numeric_files(self):
+        for n in ('rec_0001.wav', 'rec_0002.wav', 'rec_backup.wav', 'rec_old_0001.wav'):
+            self._touch(n)
+        ar.cleanup_oldest('rec', 'wav', self.td, 2)
+        left = set(os.listdir(self.td))
+        self.assertEqual(left, {'rec_0002.wav', 'rec_backup.wav', 'rec_old_0001.wav'})
+
+    def test_cleanup_sorts_by_numeric_index(self):
+        self._touch('rec_9999.wav')
+        self._touch('rec_10000.wav')
+        ar.cleanup_oldest('rec', 'wav', self.td, 2)
+        self.assertEqual(os.listdir(self.td), ['rec_10000.wav'])
+
+    def test_glob_metacharacters_in_base_are_literal(self):
+        self._touch('a[1]_0001.wav')
+        self._touch('a1_0001.wav')
+        self.assertEqual(ar.next_filename('a[1]', 'wav', self.td),
+                         os.path.join(self.td, 'a[1]_0002.wav'))
+
+    def test_validate_base_name(self):
+        self.assertTrue(ar.validate_base_name('take 1')[0])
+        for bad in ('', '  ', '..', 'a/b', 'a\\b', 'x:y', 'a?b', 'tab\tname', 'dot.'):
+            self.assertFalse(ar.validate_base_name(bad)[0], bad)
+
+    def test_unix_key_path_is_defined(self):
+        # Previously HAS_SELECT/_select_mod were undefined -> NameError on Linux/macOS
+        self.assertTrue(hasattr(ar, 'HAS_SELECT'))
+        self.assertTrue(hasattr(ar, '_select_mod'))
+
+    def test_boss_mode_ignores_prompt_keys(self):
+        s = ar.UIState()
+        s.blank = True
+        for k in 'rRdDmM':
+            s._handle_key(k)
+        self.assertFalse(s.rename or s.select_device or s.toggle_monitor)
+        s._handle_key('b')
+        s._handle_key('r')
+        self.assertTrue(s.rename)
+
+    def test_arrow_keys_do_not_trigger_actions_on_windows(self):
+        from unittest.mock import patch
+        if not ar.HAS_MSVCRT:
+            self.skipTest('msvcrt only')
+        s = ar.UIState()
+        with patch('msvcrt.kbhit', side_effect=[True, True, False]), \
+             patch('msvcrt.getch', side_effect=[b'\xe0', b'M']):
+            s.read_key()
+        self.assertFalse(s.toggle_monitor)
+
+    def test_mp3_cmd_resamples_unsupported_rate_and_downmixes(self):
+        cmd = ar.build_ffmpeg_cmd('mp3', 'o.mp3', 320, 96000, 4, 16)
+        self.assertEqual(cmd[cmd.index('-ar', cmd.index('-i')) + 1], '48000')
+        self.assertIn('-ac', cmd[cmd.index('-compression_level'):])
+
+    def test_input_queue_is_bounded_and_counts_drops(self):
+        from unittest.mock import patch, MagicMock
+        with patch('sounddevice.InputStream', return_value=MagicMock()) as cls:
+            stream = ar.AudioInputStream(44100, 1, np.int16, 512, device=0)
+            cb = cls.call_args[1]['callback']
+            data = np.ones((512, 1), dtype=np.int16)
+            for _ in range(ar.MAX_INPUT_QUEUE_CHUNKS + 5):
+                cb(data, 512, None, None)
+            self.assertEqual(stream._queue.qsize(), ar.MAX_INPUT_QUEUE_CHUNKS)
+            self.assertEqual(stream._drops, 5)
+
+    def test_wav_header_is_valid_while_recording(self):
+        import wave
+        sink = ar.WavSink()
+        path = os.path.join(self.td, 'live.wav')
+        sink.open(path, 8000, 1, 16)
+        sink.write(np.ones((100, 1), dtype=np.int16), 16)
+        with wave.open(path, 'rb') as wf:  # read without closing the sink
+            self.assertEqual(wf.getnframes(), 100)
+        sink.close()
+
+    def test_wav_size_limit_is_clamped(self):
+        from unittest.mock import patch
+        with patch('sys.argv', ['audio_recorder.py', '-s', '8GB', '-o', 'x',
+                                '--output-dir', self.td]), \
+             patch('audio_recorder.load_config', return_value={}), \
+             patch('sys.stderr', new=open(os.devnull, 'w')):
+            args = ar.parse_args()
+        self.assertEqual(args.size, ar.WAV_MAX_FILE_BYTES)
+
+    def test_invalid_output_name_rejected(self):
+        from unittest.mock import patch
+        with patch('sys.argv', ['audio_recorder.py', '-o', 'a/b']), \
+             patch('audio_recorder.load_config', return_value={}), \
+             patch('sys.stderr', new=open(os.devnull, 'w')), \
+             self.assertRaises(SystemExit):
+            ar.parse_args()
+
+    def test_preflight_fails_when_no_audio_arrives(self):
+        from unittest.mock import patch, MagicMock
+        class Args:
+            bit_depth = 16
+            sample_rate = 44100
+            channels = 1
+            device = None
+        silent = MagicMock()
+        silent.__enter__.return_value = silent
+        silent.wait_for_data.return_value = False
+        with patch('audio_recorder.AudioInputStream', return_value=silent), \
+             patch('sounddevice.query_devices', side_effect=Exception('x')):
+            ok, err = ar.test_audio_device(Args())
+        self.assertFalse(ok)
+        self.assertIn('no audio', err)
+
+    def test_failing_sink_halts_without_deleting_existing_recordings(self):
+        from unittest.mock import patch, MagicMock
+        for i in (1, 2, 3):
+            self._touch(f'ft_{i:04d}.wav')
+
+        class BadSink(ar.AudioSink):
+            fmt = 'wav'
+            def open(self, path, sr, ch, bd, br=None):
+                open(path, 'wb').close()
+            def write(self, data, bd):
+                raise OSError('boom')
+            def close(self): pass
+            def get_current_size(self): return 0
+            def get_total_bytes(self, st, cur): return 0
+
+        class Args:
+            output_dir = self.td
+            output = 'ft'
+            size = 10000000
+            max_recordings = 4
+            bit_depth = 16
+            bit_rate = 128
+            sample_rate = 44100
+            channels = 1
+            length = 5
+            file_format = 'wav'
+            device = None
+
+        stream = MagicMock()
+        stream.read.return_value = (np.zeros((100, 1), dtype=np.int16), False)
+        summary = MagicMock()
+        with patch('audio_recorder.draw_startup'), \
+             patch('audio_recorder.AudioInputStream', return_value=stream), \
+             patch('audio_recorder.draw_hud'), \
+             patch('audio_recorder.set_raw_terminal'), \
+             patch('audio_recorder.restore_terminal'), \
+             patch('audio_recorder._print_session_summary', summary):
+            ar.record_engine(Args(), BadSink())
+        for i in (1, 2, 3):
+            self.assertTrue(os.path.exists(os.path.join(self.td, f'ft_{i:04d}.wav')))
+        self.assertTrue(summary.call_args[0][0].fatal_msg)
+
+    def test_failed_device_check_does_not_touch_existing_files(self):
+        from unittest.mock import patch
+        for i in range(1, 5):
+            self._touch(f'dv_{i:04d}.wav')
+
+        class Args:
+            output_dir = self.td
+            output = 'dv'
+            size = 1000
+            max_recordings = 4
+            bit_depth = 16
+            bit_rate = 128
+            sample_rate = 44100
+            channels = 1
+            length = 1
+            file_format = 'wav'
+            device = None
+
+        with patch('audio_recorder.draw_startup', side_effect=SystemExit(1)), \
+             patch('audio_recorder.set_raw_terminal'), \
+             patch('audio_recorder.restore_terminal'), \
+             patch('audio_recorder._print_session_summary'), \
+             self.assertRaises(SystemExit):
+            ar.record_engine(Args(), ar.WavSink())
+        self.assertEqual(len(os.listdir(self.td)), 4)
+
+    def test_fatal_disk_message_is_kept_for_summary(self):
+        from unittest.mock import patch
+        import io
+        s = ar.UIState()
+        class Args:
+            file_format = 'wav'
+            bit_depth = 16
+            sample_rate = 44100
+            channels = 2
+            output_dir = '.'
+            device = None
+        with patch('audio_recorder.get_disk_info', return_value=(100 << 20, 70 << 20, 10 << 20)), \
+             patch('sys.stdout', new=io.StringIO()):
+            ar.draw_hud(s, Args(), 'test.wav', 100, 1000, 1.0)
+        self.assertIn('Low disk space', s.fatal_msg)
+
+    def test_monitor_downmixes_extra_channels(self):
+        from unittest.mock import MagicMock
+        mon = MagicMock()
+        ar.write_monitor_audio(mon, 2, np.ones((10, 4), dtype=np.int16))
+        self.assertEqual(mon.write.call_args[0][0].shape, (10, 2))
+
+
+class TestDeviceSwitchFinalizesFile(unittest.TestCase):
+    def _args(self):
+        class Args:
+            device = 0
+            channels = 2
+            sample_rate = 48000
+            bit_depth = 16
+        return Args()
+
+    def test_before_switch_runs_between_stop_and_close(self):
+        from unittest.mock import patch, MagicMock
+        order = []
+        old = MagicMock()
+        old.stop.side_effect = lambda: order.append('stop')
+        old.close.side_effect = lambda: order.append('close')
+        st = ar.UIState()
+        st.select_device = True
+        info = {'name': 'Mic', 'max_input_channels': 2, 'default_samplerate': 48000}
+        with patch('audio_recorder.prompt_select_device', return_value=1), \
+             patch('sounddevice.query_devices', return_value=info), \
+             patch('sounddevice.check_input_settings'), \
+             patch('audio_recorder.AudioInputStream', return_value=MagicMock()):
+            ar.handle_device_switch(st, self._args(), old, 48000, 2, np.int16, 512,
+                                    before_switch=lambda s: order.append('finalize'))
+        self.assertEqual(order, ['stop', 'finalize', 'close'])
+        self.assertTrue(st.new_file)
+
+    def test_failed_switch_still_starts_new_file_after_finalizing(self):
+        from unittest.mock import patch, MagicMock
+        st = ar.UIState()
+        st.select_device = True
+        info = {'name': 'Mic', 'max_input_channels': 2, 'default_samplerate': 48000}
+        restored = MagicMock()
+        streams = [Exception('cannot open'), restored]
+        def factory(*a, **k):
+            r = streams.pop(0)
+            if isinstance(r, Exception):
+                raise r
+            return r
+        with patch('audio_recorder.prompt_select_device', return_value=1), \
+             patch('sounddevice.query_devices', return_value=info), \
+             patch('sounddevice.check_input_settings'), \
+             patch('audio_recorder.AudioInputStream', side_effect=factory):
+            res = ar.handle_device_switch(st, self._args(), MagicMock(), 48000, 2, np.int16, 512,
+                                          before_switch=lambda s: None)
+        self.assertIs(res, restored)
+        self.assertTrue(st.new_file)
+
+    def test_engine_flushes_queued_audio_and_closes_file_on_switch(self):
+        from unittest.mock import patch, MagicMock
+        td = tempfile.mkdtemp()
+        try:
+            class Args:
+                output_dir = td
+                output = 'sw'
+                size = 10000000
+                max_recordings = 4
+                bit_depth = 16
+                bit_rate = 128
+                sample_rate = 8000
+                channels = 1
+                length = 3
+                file_format = 'wav'
+                device = 0
+
+            old = MagicMock()
+            old.read.return_value = (np.ones((100, 1), dtype=np.int16), False)
+            old.drain.return_value = [np.ones((50, 1), dtype=np.int16)]
+            new = MagicMock()
+            new.read.return_value = (np.ones((100, 1), dtype=np.int16), False)
+            made = []
+            def factory(*a, **k):
+                made.append(1)
+                return old if len(made) == 1 else new
+            calls = {'n': 0}
+            def key(self):
+                calls['n'] += 1
+                if calls['n'] == 1:
+                    self.select_device = True
+                elif calls['n'] >= 3:
+                    self.running = False
+            info = {'name': 'Mic2', 'max_input_channels': 1, 'default_samplerate': 8000}
+            with patch('audio_recorder.draw_startup'), \
+                 patch('audio_recorder.AudioInputStream', side_effect=factory), \
+                 patch('audio_recorder.draw_hud'), \
+                 patch('audio_recorder.UIState.read_key', key), \
+                 patch('audio_recorder.prompt_select_device', return_value=1), \
+                 patch('sounddevice.query_devices', return_value=info), \
+                 patch('sounddevice.check_input_settings'), \
+                 patch('audio_recorder.set_raw_terminal'), \
+                 patch('audio_recorder.restore_terminal'), \
+                 patch('audio_recorder._print_session_summary'):
+                ar.record_engine(Args(), ar.WavSink())
+            import wave
+            with wave.open(os.path.join(td, 'sw_0001.wav'), 'rb') as wf:
+                self.assertEqual(wf.getnframes(), 150)  # 100 read + 50 drained, footer valid
+            self.assertTrue(os.path.exists(os.path.join(td, 'sw_0002.wav')))
+        finally:
+            import shutil
+            shutil.rmtree(td, ignore_errors=True)
+
+    def test_compressed_on_rotate_is_idempotent(self):
+        from unittest.mock import patch, MagicMock
+        sink = ar.CompressedSink('mp3', 128)
+        proc = MagicMock()
+        proc.poll.return_value = None
+        with patch('subprocess.Popen', return_value=proc), \
+             patch('audio_recorder._get_file_size', return_value=1000):
+            sink.open('x.mp3', 44100, 1, 16)
+            st = ar.UIState()
+            sink.on_rotate(st)
+            sink.on_rotate(st)
+        self.assertEqual(st.total_bytes, 1000)

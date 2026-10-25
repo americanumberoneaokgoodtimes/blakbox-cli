@@ -10,6 +10,8 @@ pip install -r requirements.txt
 
 Requires **ffmpeg** in PATH for MP3/FLAC/OGG output. Install from [ffmpeg.org](https://ffmpeg.org/download.html).
 
+On Linux, PortAudio must also be installed (`sudo apt install libportaudio2`), including when running the prebuilt binary. Windows and macOS wheels bundle it.
+
 ## Usage
 
 ```bash
@@ -78,17 +80,47 @@ Live display during recording:
 |-----|--------|
 | `Q` | Quit recording |
 | `N` | Start new file (rotate now) |
-| `R` | Rename current file base name |
+| `R` | Rename: prompts for a new base name, then starts a new file `{newbase}_NNNN` (Enter, Esc or Ctrl+C on Windows cancels) |
 | `D` | Select audio input device (triggers new file rotation) |
 | `M` | Toggle headphone monitor mode (interactive output device list) |
 | `P` | Pause / resume recording |
-| `+` | Increase gain (+0.5x) |
-| `-` | Decrease gain (-0.5x) |
+| `+` | Increase gain (+1 dB, max +30 dB) |
+| `-` | Decrease gain (-1 dB, min -30 dB) |
 | `0` | Reset gain to unity (0 dB, ×1.00) |
 | `A` | Cycle auto-gain (off → normal → fast) |
-| `Shift+B` | Boss Mode — blank screen, show only fill % |
+| `Shift+B` | Boss Mode — blank screen, show only fill % (`R`, `D`, `M` are ignored while blanked) |
 | `b` | Unblank — return to full dashboard |
 | `Ctrl+C` | Stop recording |
+
+## Configuration file
+
+Defaults can be stored in `~/.blakboxrc` (TOML; needs Python 3.11+ or the `tomli` package). Command-line flags override it. Recognised keys:
+
+```toml
+format = "flac"          # wav | mp3 | flac | ogg   (CLI: --file-format)
+size = "2GB"             # bytes or with unit        (CLI: --size)
+max_recordings = 6
+bit_rate = 192
+bit_depth = 24           # 8 | 16 | 24 | 32
+sample_rate = 48000
+channels = 2
+length = 0               # seconds, 0 = unlimited
+output_dir = "~/recordings"
+device = ""              # name or index, "" = system default
+monitor_device = ""
+```
+
+Invalid values fall back to the defaults with a warning. Unknown keys are ignored.
+
+## Safety behaviour
+
+- The input device is tested (and must deliver audio) **before** any old recording is deleted.
+- Rotation only deletes files named exactly `{base}_{NNNN}.{fmt}`; other files that merely share the prefix are never touched.
+- WAV size limits are clamped to just under 4 GiB (the WAV format limit). WAV data is flushed to disk after every chunk.
+- If the output fails repeatedly (ffmpeg dies, disk full) recording halts with the reason printed in the session summary instead of rotating endlessly. Low disk space (< 50 MB) also halts recording cleanly.
+- MP3 output is resampled to the nearest rate libmp3lame supports and downmixed to stereo when needed.
+- The audio queue is bounded (about 2 minutes). While a prompt (rename/device/monitor) is open nothing is written to disk; if it stays open long enough chunks are dropped and counted under `Drop`.
+- `-o` / rename names may not contain path separators or characters illegal on Windows.
 
 ## File Rotation
 
@@ -98,7 +130,7 @@ On exit, a summary of all files created this session is printed with their sizes
 
 ## System Audio Capture (Windows)
 
-To record system audio (e.g. music, video playback), enable **Stereo Mix** or use a WASAPI loopback device:
+To record system audio (e.g. music, video playback), enable **Stereo Mix** (or another virtual input such as a loopback driver) in the sound settings. WASAPI loopback capture is **not** supported, because PortAudio's WASAPI loopback devices are not listed as inputs. `--list-devices` shows the host API of each device in brackets (a microphone appears once per host API on Windows):
 
 ```bash
 python audio_recorder.py --list-devices   # find the Stereo Mix device
