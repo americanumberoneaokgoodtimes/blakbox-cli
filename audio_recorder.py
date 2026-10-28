@@ -163,7 +163,31 @@ ANSI = {
 }
 
 
-CONFIG_PATH = os.path.expanduser('~/.blakboxrc')
+def _get_config_path():
+    """Get config file path following XDG Base Directory Specification."""
+    xdg_config = os.environ.get('XDG_CONFIG_HOME')
+    if xdg_config:
+        config_dir = os.path.join(xdg_config, 'blakbox')
+    else:
+        config_dir = os.path.join(os.path.expanduser('~'), '.config', 'blakbox')
+    os.makedirs(config_dir, exist_ok=True)
+    return os.path.join(config_dir, 'config.toml')
+
+
+def _migrate_old_config():
+    """Migrate config from old location (~/.blakboxrc) to new XDG location."""
+    old_path = os.path.expanduser('~/.blakboxrc')
+    new_path = CONFIG_PATH
+    if os.path.exists(old_path) and not os.path.exists(new_path):
+        try:
+            shutil.move(old_path, new_path)
+            print(f'{ANSI["green"]}Migrated config to {new_path}{ANSI["reset"]}')
+        except Exception:
+            pass
+
+
+CONFIG_PATH = _get_config_path()
+_migrate_old_config()
 
 _INVALID_NAME_CHARS = set('<>:"/\\|?*')
 
@@ -198,7 +222,7 @@ def _hostapi_tag(dev):
 
 
 def load_config():
-    """Load configuration from ~/.blakboxrc (TOML format). Returns dict or empty dict."""
+    """Load configuration from config file (TOML format). Returns dict or empty dict."""
     if not os.path.exists(CONFIG_PATH):
         return {}
     if tomllib is None:
@@ -210,6 +234,25 @@ def load_config():
     except Exception as e:
         print(f'{ANSI["yellow"]}Warning: failed to parse {CONFIG_PATH}: {e}{ANSI["reset"]}', file=sys.stderr)
         return {}
+
+
+def save_config(config_dict):
+    """Save configuration to config file (TOML format)."""
+    try:
+        import tomli_w
+    except ImportError:
+        try:
+            import tomllib as tomli_w  # Python 3.11+ has tomllib but no writer
+        except ImportError:
+            print(f'{ANSI["yellow"]}Warning: tomli_w not installed, cannot save config{ANSI["reset"]}', file=sys.stderr)
+            return False
+    try:
+        with open(CONFIG_PATH, 'wb') as f:
+            tomli_w.dump(config_dict, f)
+        return True
+    except Exception as e:
+        print(f'{ANSI["yellow"]}Warning: failed to save config: {e}{ANSI["reset"]}', file=sys.stderr)
+        return False
 
 
 def check_ffmpeg():
@@ -324,6 +367,9 @@ def parse_args():
                         help='List available audio input devices and exit')
     args = parser.parse_args()
 
+    # Track which args were explicitly provided via CLI (before config/defaults)
+    cli_provided = set(vars(args).keys())
+
     # Apply config file, then hardcoded defaults for any missing values
     config = load_config()
     defaults = {
@@ -417,6 +463,33 @@ def parse_args():
             args.length = 0
     except (ValueError, TypeError):
         args.length = DEFAULT_LENGTH
+
+    # Save CLI-provided args to config (they become new defaults)
+    if cli_provided:
+        config_to_save = {}
+        key_map = {
+            'file_format': 'format',
+            'max_recordings': 'max_recordings',
+            'bit_rate': 'bit_rate',
+            'bit_depth': 'bit_depth',
+            'sample_rate': 'sample_rate',
+            'channels': 'channels',
+            'length': 'length',
+            'output_dir': 'output_dir',
+            'device': 'device',
+            'monitor_device': 'monitor_device',
+        }
+        for cli_key, config_key in key_map.items():
+            if cli_key in cli_provided and hasattr(args, cli_key):
+                val = getattr(args, cli_key)
+                if cli_key in ('device', 'monitor_device') and val is None:
+                    val = ''
+                config_to_save[config_key] = val
+        if config_to_save:
+            # Merge with existing config
+            existing_config = load_config()
+            existing_config.update(config_to_save)
+            save_config(existing_config)
 
     if args.list_devices:
         print(f'{ANSI["bold"]}Available audio input devices:{ANSI["reset"]}')
@@ -1631,9 +1704,7 @@ def draw_hud(S, args, cur_file, cur_size, size_lim, elapsed, total_override=None
         f'  {ANSI["yellow"]}[M]{ANSI["reset"]}onitor'
         f'  {ANSI["dim"]}[P]{ANSI["reset"]}ause/Resume'
         f'  {ANSI["dim"]}[B]{ANSI["reset"]}lank(boss)'
-        f'  {ANSI["dim"]}[b]{ANSI["reset"]}Unblank'
-        f'  {ANSI["dim"]}Ctrl+C{ANSI["reset"]} Stop',
-        f'{ANSI["cyan"]}{"-" * 54}{ANSI["reset"]}',
+       # f'{ANSI["cyan"]}{"-" * 54}{ANSI["reset"]}',
     ]
 
     print(f'{ANSI["clear"]}{ANSI["home"]}' + '\n'.join(lines), end='', flush=True)
